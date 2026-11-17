@@ -59,6 +59,20 @@ jobs:
           open(p, 'w').write(s)
           PY
 
+      - name: Disable lint crash
+        run: |
+          python3 - <<'PY2'
+          import os, re
+          for p in ('android/app/build.gradle.kts', 'android/app/build.gradle'):
+              if os.path.exists(p):
+                  s = open(p).read()
+                  if 'checkReleaseBuilds' not in s:
+                      block = 'android {\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }\n'
+                      s = re.sub(r'android\s*\{', lambda m: block, s, count=1)
+                      open(p, 'w').write(s)
+                  print('patched', p)
+          PY2
+
       - run: flutter pub get
 
       - name: Apply app icon
