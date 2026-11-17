@@ -30,10 +30,17 @@ jobs:
           cp -r lib /tmp/lib_backup
           cp pubspec.yaml /tmp/pubspec_backup.yaml
           cp -r tools /tmp/tools_backup
+          cp -r android_extra /tmp/android_extra_backup
           flutter create --platforms=android --project-name jarvis_app --org com.kaido .
           cp -r /tmp/lib_backup/. lib/
           cp /tmp/pubspec_backup.yaml pubspec.yaml
           rm -rf test
+
+      - name: Add native Android code
+        run: |
+          mkdir -p android/app/src/main/kotlin/com/kaido/jarvis_app
+          cp /tmp/android_extra_backup/*.kt android/app/src/main/kotlin/com/kaido/jarvis_app/
+          ls android/app/src/main/kotlin/com/kaido/jarvis_app/
 
       - name: Generate app icon images
         run: |
@@ -46,15 +53,20 @@ jobs:
           import re
           p = 'android/app/src/main/AndroidManifest.xml'
           s = open(p).read()
-          add = ('<uses-permission android:name="android.permission.INTERNET"/>\n'
-                 '    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n'
-                 '    <uses-permission android:name="com.android.alarm.permission.SET_ALARM"/>\n'
-                 '    <queries>\n'
-                 '        <intent><action android:name="android.speech.RecognitionService"/></intent>\n'
-                 '        <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>\n'
-                 '    </queries>\n'
-                 '    ')
+          perms = ['INTERNET', 'RECORD_AUDIO', 'FOREGROUND_SERVICE',
+                   'FOREGROUND_SERVICE_MICROPHONE', 'POST_NOTIFICATIONS',
+                   'SYSTEM_ALERT_WINDOW', 'WAKE_LOCK', 'VIBRATE',
+                   'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS']
+          add = ''.join('<uses-permission android:name="android.permission.%s"/>\n    ' % x for x in perms)
+          add += '<uses-permission android:name="com.android.alarm.permission.SET_ALARM"/>\n    '
+          add += ('<queries>\n'
+                  '        <intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent>\n'
+                  '        <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>\n'
+                  '    </queries>\n'
+                  '    ')
           s = s.replace('<application', add + '<application', 1)
+          svc = '<service android:name=".KeepAliveService" android:exported="false" android:foregroundServiceType="microphone"/>\n    '
+          s = s.replace('</application>', svc + '</application>', 1)
           s = re.sub(r'android:label="[^"]*"', 'android:label="Jarvis"', s, count=1)
           open(p, 'w').write(s)
           PY
