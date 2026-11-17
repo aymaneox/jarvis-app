@@ -16,6 +16,10 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -25,10 +29,16 @@ jobs:
         run: |
           cp -r lib /tmp/lib_backup
           cp pubspec.yaml /tmp/pubspec_backup.yaml
+          cp -r tools /tmp/tools_backup
           flutter create --platforms=android --project-name jarvis_app --org com.kaido .
           cp -r /tmp/lib_backup/. lib/
           cp /tmp/pubspec_backup.yaml pubspec.yaml
           rm -rf test
+
+      - name: Generate app icon images
+        run: |
+          pip install pillow
+          python3 /tmp/tools_backup/make_icon.py
 
       - name: Patch Android manifest
         run: |
@@ -38,6 +48,7 @@ jobs:
           s = open(p).read()
           add = ('<uses-permission android:name="android.permission.INTERNET"/>\n'
                  '    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n'
+                 '    <uses-permission android:name="com.android.alarm.permission.SET_ALARM"/>\n'
                  '    <queries>\n'
                  '        <intent><action android:name="android.speech.RecognitionService"/></intent>\n'
                  '        <intent><action android:name="android.intent.action.TTS_SERVICE"/></intent>\n'
@@ -49,6 +60,9 @@ jobs:
           PY
 
       - run: flutter pub get
+
+      - name: Apply app icon
+        run: dart run flutter_launcher_icons
 
       - run: flutter build apk --release
 
