@@ -87,6 +87,18 @@ jobs:
 
       - run: flutter pub get
 
+      - name: Raise compileSdk of old plugins
+        run: |
+          CACHE="${PUB_CACHE:-$HOME/.pub-cache}"
+          for d in "$CACHE"/hosted/pub.dev/flutter_voice_processor-* "$CACHE"/hosted/pub.dev/porcupine_flutter-*; do
+            f="$d/android/build.gradle"
+            if [ -f "$f" ]; then
+              sed -i -E -e 's/(compileSdk(Version)?[ =]+)[0-9]+/\1_X_/' -e 's/_X_/35/' "$f"
+              echo "patched $f"
+              grep -n "compileSdk" "$f" || true
+            fi
+          done
+
       - name: Apply app icon
         run: dart run flutter_launcher_icons
 
