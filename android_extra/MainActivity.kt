@@ -137,6 +137,32 @@ class MainActivity : FlutterActivity() {
                             }.start()
                         }
                     }
+                    "tapAt" -> {
+                        val s = JarvisAccessibilityService.instance
+                        if (s == null) {
+                            result.success("no_service")
+                        } else {
+                            val x = (call.argument<Number>("x") ?: 500).toDouble()
+                            val y = (call.argument<Number>("y") ?: 500).toDouble()
+                            result.success(s.tapAt(x, y))
+                        }
+                    }
+                    "screenshotJpeg" -> {
+                        val s = JarvisAccessibilityService.instance
+                        if (s == null) {
+                            result.success(null)
+                        } else {
+                            s.screenshotJpeg { bytes -> result.success(bytes) }
+                        }
+                    }
+                    "describeScreen" -> {
+                        val s = JarvisAccessibilityService.instance
+                        if (s == null) {
+                            result.success("")
+                        } else {
+                            result.success(s.describeScreen())
+                        }
+                    }
                     else -> result.notImplemented()
                 }
             }
