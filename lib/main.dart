@@ -104,6 +104,11 @@ class _ChatPageState extends State<ChatPage> {
   DateTime _lastRestart = DateTime.fromMillisecondsSinceEpoch(0);
   int _zeroFrames = 0;
   double _lastRms = 0;
+  String _wakeError = '';
+  DateTime _lastWakeTry = DateTime.fromMillisecondsSinceEpoch(0);
+  String _voiceName = '';
+  double _pitch = 0.7;
+  double _rate = 0.45;
   bool _restarting = false;
 
   @override
@@ -157,10 +162,21 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<void> _setupVoice() async {
     try {
+      final p = await SharedPreferences.getInstance();
+      _pitch = p.getDouble('voice_pitch') ?? 0.7;
+      _rate = p.getDouble('voice_rate') ?? 0.45;
+      final savedName = p.getString('voice_name') ?? '';
+      final savedLocale = p.getString('voice_locale') ?? '';
       await _tts.awaitSpeakCompletion(true);
       await _tts.setLanguage('en-GB');
-      await _tts.setPitch(0.7);
-      await _tts.setSpeechRate(0.45);
+      await _tts.setPitch(_pitch);
+      await _tts.setSpeechRate(_rate);
+      if (savedName.isNotEmpty) {
+        _voiceName = savedName;
+        await _tts.setVoice(
+            <String, String>{'name': savedName, 'locale': savedLocale});
+        return;
+      }
       final voices = await _tts.getVoices;
       if (voices is List) {
         final gb = voices.whereType<Map>().where((v) {
@@ -187,6 +203,142 @@ class _ChatPageState extends State<ChatPage> {
         }
       }
     } catch (_) {}
+  }
+
+  Future<void> _pickVoice() async {
+    final list = <Map<String, String>>[];
+    try {
+      final v = await _tts.getVoices;
+      if (v is List) {
+        for (final e in v.whereType<Map>()) {
+          final loc = (e['locale'] ?? '').toString();
+          if (loc.toLowerCase().startsWith('en')) {
+            list.add({'name': e['name'].toString(), 'locale': loc});
+          }
+        }
+      }
+    } catch (_) {}
+    list.sort((a, b) {
+      final c = a['locale']!.compareTo(b['locale']!);
+      return c != 0 ? c : a['name']!.compareTo(b['name']!);
+    });
+    if (!mounted) return;
+    if (list.isEmpty) {
+      _toast('No English voices found. Install "Speech Services by Google" and its English (UK) voice.');
+      return;
+    }
+
+    var pitch = _pitch;
+    var rate = _rate;
+    var chosen = _voiceName;
+    var chosenLocale = '';
+
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setD) => AlertDialog(
+          title: const Text('Choose Jarvis voice'),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 420,
+            child: Column(
+              children: [
+                Row(children: [
+                  const Text('Deep'),
+                  Expanded(
+                    child: Slider(
+                      min: 0.4,
+                      max: 1.4,
+                      value: pitch,
+                      onChanged: (x) => setD(() => pitch = x),
+                    ),
+                  ),
+                  const Text('High'),
+                ]),
+                Row(children: [
+                  const Text('Slow'),
+                  Expanded(
+                    child: Slider(
+                      min: 0.25,
+                      max: 0.8,
+                      value: rate,
+                      onChanged: (x) => setD(() => rate = x),
+                    ),
+                  ),
+                  const Text('Fast'),
+                ]),
+                const Text('Tap a voice to hear it',
+                    style: TextStyle(fontSize: 12)),
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: list.length,
+                    itemBuilder: (_, i) {
+                      final v = list[i];
+                      final sel = v['name'] == chosen;
+                      return ListTile(
+                        dense: true,
+                        selected: sel,
+                        title: Text(v['name']!),
+                        subtitle: Text(v['locale']!),
+                        trailing: sel ? const Icon(Icons.check) : null,
+                        onTap: () async {
+                          setD(() {
+                            chosen = v['name']!;
+                            chosenLocale = v['locale']!;
+                          });
+                          try {
+                            await _tts.setVoice(<String, String>{
+                              'name': v['name']!,
+                              'locale': v['locale']!,
+                            });
+                            await _tts.setPitch(pitch);
+                            await _tts.setSpeechRate(rate);
+                            await _tts.speak(
+                                'Good evening, sir. How may I assist you?');
+                          } catch (_) {}
+                        },
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () async {
+                try {
+                  await _tts.setPitch(pitch);
+                  await _tts.setSpeechRate(rate);
+                  await _tts.speak('Good evening, sir.');
+                } catch (_) {}
+              },
+              child: const Text('Test'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    // save (also applies the sliders even if no new voice was tapped)
+    _pitch = pitch;
+    _rate = rate;
+    final p = await SharedPreferences.getInstance();
+    await p.setDouble('voice_pitch', pitch);
+    await p.setDouble('voice_rate', rate);
+    try {
+      await _tts.setPitch(pitch);
+      await _tts.setSpeechRate(rate);
+    } catch (_) {}
+    if (chosen.isNotEmpty && chosenLocale.isNotEmpty) {
+      _voiceName = chosen;
+      await p.setString('voice_name', chosen);
+      await p.setString('voice_locale', chosenLocale);
+    }
   }
 
   Future<void> _speak(String text) async {
@@ -257,6 +409,9 @@ class _ChatPageState extends State<ChatPage> {
         _key = c1.text.trim();
         _pvKey = c2.text.trim();
       });
+      if (_active && _pm == null && _pvKey.isNotEmpty) {
+        await _startWakeWord();
+      }
     }
   }
 
@@ -336,8 +491,11 @@ class _ChatPageState extends State<ChatPage> {
 
   Future<void> _startWakeWord() async {
     if (_pm != null) return;
+    _lastWakeTry = DateTime.now();
     if (_pvKey.isEmpty) {
+      _wakeError = 'no Picovoice key. Tap the key icon and paste your Picovoice AccessKey';
       _toast('Add your Picovoice key (key icon) to enable the "Jarvis" wake word');
+      if (mounted) setState(() {});
       return;
     }
     try {
@@ -350,12 +508,16 @@ class _ChatPageState extends State<ChatPage> {
       );
       await pm.start();
       _pm = pm;
+      _wakeError = '';
       _attachFrames();
     } on PorcupineException catch (e) {
+      _wakeError = '${e.message}';
       _toast('Wake word failed: ${e.message}');
     } catch (e) {
+      _wakeError = '$e';
       _toast('Wake word failed: $e');
     }
+    if (mounted) setState(() {});
   }
 
   void _attachFrames() {
@@ -400,6 +562,14 @@ class _ChatPageState extends State<ChatPage> {
         _lastRestart = now;
         _restartWake();
       }
+    }
+    // wake word is off (for example the key was added later): try again
+    if (_pm == null &&
+        _pvKey.isNotEmpty &&
+        !_restarting &&
+        !_inCall &&
+        now.difference(_lastWakeTry).inSeconds > 20) {
+      _startWakeWord();
     }
     if (mounted) setState(() {});
   }
@@ -533,6 +703,7 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _conversation({required bool afterWake}) async {
     if (_inCall) return;
     _inCall = true;
+    _loadApps();
     _lastProgress = DateTime.now();
     var first = afterWake;
     var quiet = 0;
@@ -588,16 +759,9 @@ class _ChatPageState extends State<ChatPage> {
         }
         quiet = 0;
         if (r.heard.isNotEmpty) _addMsg('user', r.heard);
-        if (r.say.isNotEmpty) _addMsg('model', r.say);
-        for (final a in r.actions) {
-          await _run(a);
-        }
-        if (r.say.isNotEmpty) {
-          _mode('speaking');
-          await _speak(r.say);
-        }
+        final done = await _handleReply(r, r.heard);
         _lastProgress = DateTime.now();
-        if (r.end) break;
+        if (done.end) break;
         await Future.delayed(const Duration(milliseconds: 250));
         _pre.clear();
       }
@@ -694,8 +858,16 @@ Action formats (use only these):
 {"type":"system","action":"back|home|recents|notifications|quick_settings|lock"}
 {"type":"click","text":"<visible text or label of a button on screen>"}
 {"type":"type","text":"..."}  types text into the text box that is currently selected on screen
+{"type":"tap_at","x":0-1000,"y":0-1000}  taps a point on the screen (0,0 is top-left, 1000,1000 is bottom-right); use it when click by text is not possible
+{"type":"look"}  captures the phone screen; you then receive a screenshot plus the list of visible elements and continue the task
+{"type":"settings","page":"accessibility|wifi|bluetooth|display|sound|battery|battery_optimization|apps|all_apps|location|date|language|keyboard|storage|airplane|nfc|vpn|privacy|security|about|developer|data_usage|wireless|overlay|app_details","app":"<app name, only for app_details>"}  opens that exact Android settings page directly
 
 Rules:
+- To open a phone settings page, use the "settings" action: it goes to the exact page.
+- For tasks that need several steps on screen (menus, finding a button, forms): do one or two actions, then add {"type":"look"} as the LAST action to check the result. Repeat until the task is done, then confirm in "say" with no look action. Use at most 8 look steps.
+- When the user asks what is on the screen or what to do next, use a look action first, then answer in "say".
+- Never tap or type for payments, passwords, deleting data or sending money without asking the user to confirm first.
+- The phone is a Xiaomi with HyperOS, so settings menus may differ from stock Android: trust the screenshot.
 - For "in N minutes" reminders use a timer. For a clock time use an alarm.
 - To write in another app: first open the app or chat, then use a type action, then a click action with the visible text of the send button.
 - Actions run in order, so you can chain them (open_app, type, click).
@@ -707,7 +879,13 @@ Rules:
 ''';
   }
 
-  Future<Reply> _askGemini({Uint8List? audio}) async {
+  Future<Reply> _askGemini({
+    Uint8List? audio,
+    Uint8List? screen,
+    String? screenText,
+    String? goal,
+    String? log,
+  }) async {
     var recent = _msgs.length > 10
         ? _msgs.sublist(_msgs.length - 10)
         : List<Msg>.from(_msgs);
@@ -735,6 +913,18 @@ Rules:
           {'text': 'Respond to what I just said.'},
         ],
       });
+    }
+    if (screen != null || screenText != null) {
+      final parts = <Map<String, dynamic>>[];
+      if (screen != null) {
+        parts.add({
+          'inlineData': {'mimeType': 'image/jpeg', 'data': base64Encode(screen)}
+        });
+      }
+      parts.add({
+        'text': 'This is the phone screen right now.\nVisible elements:\n${screenText ?? ''}\nTask: ${goal ?? ''}\nActions already done: ${log ?? ''}\nContinue the task with the next action(s). If it is finished or impossible, tell the user in "say" and do NOT use a look action.'
+      });
+      contents.add({'role': 'user', 'parts': parts});
     }
 
     final res = await http.post(
@@ -796,6 +986,118 @@ Rules:
 
   int _int(dynamic v) => v is num ? v.toInt() : int.tryParse('$v') ?? 0;
 
+  String _norm(String s) => s.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+  static const _aliases = <String, String>{
+    'claude': 'com.anthropic.claude',
+    'chatgpt': 'com.openai.chatgpt',
+    'gemini': 'com.google.android.apps.bard',
+    'whatsapp': 'com.whatsapp',
+    'instagram': 'com.instagram.android',
+    'facebook': 'com.facebook.katana',
+    'messenger': 'com.facebook.orca',
+    'telegram': 'org.telegram.messenger',
+    'tiktok': 'com.zhiliaoapp.musically',
+    'youtube': 'com.google.android.youtube',
+    'spotify': 'com.spotify.music',
+    'chrome': 'com.android.chrome',
+    'netflix': 'com.netflix.mediaclient',
+    'snapchat': 'com.snapchat.android',
+    'twitter': 'com.twitter.android',
+    'x': 'com.twitter.android',
+    'discord': 'com.discord',
+    'gmail': 'com.google.android.gm',
+    'maps': 'com.google.android.apps.maps',
+    'googlemaps': 'com.google.android.apps.maps',
+    'playstore': 'com.android.vending',
+    'settings': 'com.android.settings',
+    'camera': 'com.android.camera',
+  };
+
+  static const _settingsPages = <String, String>{
+    'accessibility': 'android.settings.ACCESSIBILITY_SETTINGS',
+    'wifi': 'android.settings.WIFI_SETTINGS',
+    'bluetooth': 'android.settings.BLUETOOTH_SETTINGS',
+    'display': 'android.settings.DISPLAY_SETTINGS',
+    'sound': 'android.settings.SOUND_SETTINGS',
+    'battery': 'android.settings.BATTERY_SAVER_SETTINGS',
+    'battery_optimization': 'android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS',
+    'apps': 'android.settings.APPLICATION_SETTINGS',
+    'all_apps': 'android.settings.MANAGE_ALL_APPLICATIONS_SETTINGS',
+    'location': 'android.settings.LOCATION_SOURCE_SETTINGS',
+    'date': 'android.settings.DATE_SETTINGS',
+    'language': 'android.settings.LOCALE_SETTINGS',
+    'keyboard': 'android.settings.INPUT_METHOD_SETTINGS',
+    'storage': 'android.settings.INTERNAL_STORAGE_SETTINGS',
+    'airplane': 'android.settings.AIRPLANE_MODE_SETTINGS',
+    'nfc': 'android.settings.NFC_SETTINGS',
+    'vpn': 'android.settings.VPN_SETTINGS',
+    'privacy': 'android.settings.PRIVACY_SETTINGS',
+    'security': 'android.settings.SECURITY_SETTINGS',
+    'about': 'android.settings.DEVICE_INFO_SETTINGS',
+    'developer': 'android.settings.APPLICATION_DEVELOPMENT_SETTINGS',
+    'data_usage': 'android.settings.DATA_USAGE_SETTINGS',
+    'wireless': 'android.settings.WIRELESS_SETTINGS',
+    'overlay': 'android.settings.action.MANAGE_OVERLAY_PERMISSION',
+  };
+
+  String _describeAction(Map<String, dynamic> a) {
+    final extra = a['text'] ?? a['name'] ?? a['page'] ?? a['direction'] ?? a['action'] ?? '';
+    return '${a['type']} $extra'.trim();
+  }
+
+  Future<Reply> _handleReply(Reply first, String goal) async {
+    var r = first;
+    final log = <String>[];
+    var step = 0;
+    while (true) {
+      var wantLook = false;
+      for (final a in r.actions) {
+        if (a['type'] == 'look') {
+          wantLook = true;
+          continue;
+        }
+        await _run(a);
+        log.add(_describeAction(a));
+      }
+      final text = (r.say.isEmpty && !wantLook) ? 'Done.' : r.say;
+      if (text.isNotEmpty) {
+        _addMsg('model', text);
+        if (!wantLook || step == 0) {
+          _mode('speaking');
+          await _speak(text);
+        }
+      }
+      if (!wantLook || step >= 8) return r;
+      step++;
+      _mode('thinking');
+      await Future.delayed(const Duration(milliseconds: 1000));
+      Uint8List? shot;
+      var tree = '';
+      try {
+        shot = await _native.invokeMethod<Uint8List>('screenshotJpeg');
+      } catch (_) {}
+      try {
+        tree = (await _native.invokeMethod<String>('describeScreen')) ?? '';
+      } catch (_) {}
+      if (shot == null && tree.isEmpty) {
+        _addMsg('model',
+            'I cannot see the screen. Turn on "Jarvis control" in Accessibility settings.');
+        return r;
+      }
+      try {
+        r = await _askGemini(
+            screen: shot, screenText: tree, goal: goal, log: log.join('; '));
+      } catch (e) {
+        r = Reply('Error: $e', error: true);
+      }
+      if (r.error) {
+        _addMsg('model', r.say);
+        return r;
+      }
+    }
+  }
+
   String _clean(String s, {bool plus = false}) =>
       s.replaceAll(RegExp(plus ? r'[^0-9+]' : r'[^0-9]'), '');
 
@@ -820,28 +1122,78 @@ Rules:
     try {
       switch (a['type']) {
         case 'open_app':
-          final target = (a['name'] ?? '').toString().toLowerCase().trim();
+          final raw = (a['name'] ?? '').toString();
+          final target = _norm(raw);
           Map<String, String>? hit;
           for (final app in _apps) {
-            if ((app['name'] ?? '').toLowerCase() == target) {
+            if (_norm(app['name'] ?? '') == target) {
               hit = app;
               break;
             }
           }
           if (hit == null && target.isNotEmpty) {
             for (final app in _apps) {
-              final nm = (app['name'] ?? '').toLowerCase();
-              if (nm.contains(target) || target.contains(nm)) {
+              final nm = _norm(app['name'] ?? '');
+              if (nm.isNotEmpty && (nm.contains(target) || target.contains(nm))) {
                 hit = app;
                 break;
               }
             }
           }
-          if (hit != null) {
-            await _native.invokeMethod('launchApp', {'package': hit['package']});
-          } else {
-            _addMsg('model', 'App not found: $target');
+          if (hit == null && target.isNotEmpty) {
+            for (final app in _apps) {
+              if (_norm(app['package'] ?? '').contains(target)) {
+                hit = app;
+                break;
+              }
+            }
           }
+          String? pkg = hit?['package'];
+          pkg ??= _aliases[target];
+          var opened = false;
+          if (pkg != null) {
+            opened = (await _native
+                    .invokeMethod<bool>('launchApp', {'package': pkg})) ??
+                false;
+          }
+          if (!opened) {
+            _addMsg('model',
+                'I could not open "$raw". Apps I can see on this phone: ${_apps.length}. If that number is small, allow "Installed apps" for Jarvis in the phone app permissions.');
+          }
+          break;
+        case 'settings':
+          final page = (a['page'] ?? '').toString().toLowerCase();
+          if (page == 'app_details') {
+            final t2 = _norm((a['app'] ?? '').toString());
+            String? p2;
+            for (final app in _apps) {
+              final nm = _norm(app['name'] ?? '');
+              if (nm == t2 || (t2.isNotEmpty && nm.contains(t2))) {
+                p2 = app['package'];
+                break;
+              }
+            }
+            p2 ??= _aliases[t2];
+            if (p2 != null) {
+              await AndroidIntent(
+                action: 'android.settings.APPLICATION_DETAILS_SETTINGS',
+                data: 'package:$p2',
+              ).launch();
+            } else {
+              _addMsg('model', 'I could not find that app to open its settings.');
+            }
+          } else {
+            final act = _settingsPages[page] ?? 'android.settings.SETTINGS';
+            await AndroidIntent(action: act).launch();
+          }
+          break;
+        case 'tap_at':
+          await _a11y('tapAt', {
+            'x': (a['x'] is num ? (a['x'] as num).toDouble() : 500.0),
+            'y': (a['y'] is num ? (a['y'] as num).toDouble() : 500.0),
+          });
+          break;
+        case 'look':
           break;
         case 'alarm':
           await AndroidIntent(
@@ -945,17 +1297,16 @@ Rules:
       r = Reply('Error: $e', error: true);
     }
     if (!mounted) return;
-    setState(() {
-      _msgs.add(Msg('model', r.say.isEmpty ? 'Done.' : r.say));
-      _busy = false;
-    });
-    _scrollDown();
-    if (!r.error) {
-      for (final a in r.actions) {
-        await _run(a);
-      }
-      await _speak(r.say);
+    if (r.error) {
+      setState(() {
+        _msgs.add(Msg('model', r.say));
+        _busy = false;
+      });
+      _scrollDown();
+      return;
     }
+    await _handleReply(r, text);
+    if (mounted) setState(() => _busy = false);
   }
 
   // ---------------- UI ----------------
@@ -967,8 +1318,8 @@ Rules:
           return 'Another app is using the microphone (voice message, call...). I will hear you again when it stops.';
         }
         return _pm != null
-            ? 'Say "Jarvis"...   (mic ${_lastRms.round()})'
-            : 'Wake word is off. Tap the call button to talk.';
+            ? 'Say "Jarvis"...   (mic ${_lastRms.round()}, apps ${_apps.length})'
+            : 'Wake word is OFF${_wakeError.isEmpty ? '' : ': $_wakeError'}. You can still tap the call button to talk.';
       case 'listening':
         return 'Listening...';
       case 'thinking':
@@ -1013,6 +1364,10 @@ Rules:
                 await _native.invokeMethod('openA11ySettings');
               } catch (_) {}
             },
+          ),
+          IconButton(
+            icon: const Icon(Icons.record_voice_over),
+            onPressed: _pickVoice,
           ),
           IconButton(icon: const Icon(Icons.key), onPressed: _askKeys),
         ],
