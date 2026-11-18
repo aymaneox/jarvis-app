@@ -41,6 +41,24 @@ jobs:
           mkdir -p android/app/src/main/kotlin/com/kaido/jarvis_app
           cp /tmp/android_extra_backup/*.kt android/app/src/main/kotlin/com/kaido/jarvis_app/
           ls android/app/src/main/kotlin/com/kaido/jarvis_app/
+          mkdir -p android/app/src/main/res/xml android/app/src/main/res/values
+          cat > android/app/src/main/res/xml/jarvis_accessibility.xml << 'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/jarvis_a11y_desc"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagReportViewIds"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100" />
+          XML
+          cat > android/app/src/main/res/values/jarvis_strings.xml << 'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="jarvis_a11y_desc">Lets Jarvis scroll, tap, type, press system buttons and take screenshots when you ask by voice.</string>
+          </resources>
+          XML
 
       - name: Generate app icon images
         run: |
@@ -65,7 +83,12 @@ jobs:
                   '    </queries>\n'
                   '    ')
           s = s.replace('<application', add + '<application', 1)
-          svc = '<service android:name=".KeepAliveService" android:exported="false" android:foregroundServiceType="microphone"/>\n    '
+          svc = ('<service android:name=".KeepAliveService" android:exported="false" android:foregroundServiceType="microphone"/>\n'
+                 '    <service android:name=".JarvisAccessibilityService" android:exported="true" android:label="Jarvis control" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">\n'
+                 '        <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>\n'
+                 '        <meta-data android:name="android.accessibilityservice" android:resource="@xml/jarvis_accessibility"/>\n'
+                 '    </service>\n'
+                 '    ')
           s = s.replace('</application>', svc + '</application>', 1)
           s = re.sub(r'android:label="[^"]*"', 'android:label="Jarvis"', s, count=1)
           open(p, 'w').write(s)
