@@ -2,6 +2,9 @@ package com.kaido.jarvis_app
 
 import android.content.Intent
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -71,6 +74,68 @@ class MainActivity : FlutterActivity() {
                         val state = call.argument<String>("state") ?: "idle"
                         KeepAliveService.instance?.setOrb(state)
                         result.success(true)
+                    }
+
+                    // ----- accessibility (screen control) -----
+                    "a11yEnabled" -> {
+                        result.success(JarvisAccessibilityService.instance != null)
+                    }
+                    "openA11ySettings" -> {
+                        try {
+                            val i = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            applicationContext.startActivity(i)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.success(false)
+                        }
+                    }
+                    "scroll" -> {
+                        val s = JarvisAccessibilityService.instance
+                        if (s == null) {
+                            result.success("no_service")
+                        } else {
+                            result.success(s.scroll(call.argument<String>("direction") ?: "down"))
+                        }
+                    }
+                    "global" -> {
+                        val s = JarvisAccessibilityService.instance
+                        if (s == null) {
+                            result.success("no_service")
+                        } else {
+                            result.success(s.global(call.argument<String>("action") ?: ""))
+                        }
+                    }
+                    "clickText" -> {
+                        val s = JarvisAccessibilityService.instance
+                        if (s == null) {
+                            result.success("no_service")
+                        } else {
+                            result.success(s.clickText(call.argument<String>("text") ?: ""))
+                        }
+                    }
+                    "typeText" -> {
+                        val s = JarvisAccessibilityService.instance
+                        if (s == null) {
+                            result.success("no_service")
+                        } else {
+                            result.success(s.typeText(call.argument<String>("text") ?: ""))
+                        }
+                    }
+                    "screenRecord" -> {
+                        val s = JarvisAccessibilityService.instance
+                        if (s == null) {
+                            result.success("no_service")
+                        } else {
+                            Thread {
+                                val ok = try {
+                                    s.screenRecord()
+                                } catch (e: Exception) {
+                                    false
+                                }
+                                Handler(Looper.getMainLooper()).post { result.success(ok) }
+                            }.start()
+                        }
                     }
                     else -> result.notImplemented()
                 }
