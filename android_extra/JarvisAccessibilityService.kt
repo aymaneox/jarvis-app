@@ -3,11 +3,14 @@ package com.kaido.jarvis_app
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Path
 import android.os.Build
 import android.os.Bundle
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import java.io.ByteArrayOutputStream
 
 class JarvisAccessibilityService : AccessibilityService() {
 
@@ -209,5 +212,107 @@ class JarvisAccessibilityService : AccessibilityService() {
             if (clickText(s)) break
         }
         return true
+    }
+
+    // ---------- tap at a point (0..1000 on both axes) ----------
+
+    fun tapAt(xNorm: Double, yNorm: Double): Boolean {
+        val dm = resources.displayMetrics
+        val x = (dm.widthPixels * xNorm / 1000.0).toFloat()
+        val y = (dm.heightPixels * yNorm / 1000.0).toFloat()
+        val p = Path()
+        p.moveTo(x, y)
+        return swipe(p, 60)
+    }
+
+    // ---------- see the screen ----------
+
+    fun screenshotJpeg(callback: (ByteArray?) -> Unit) {
+        if (Build.VERSION.SDK_INT < 30) {
+            callback(null)
+            return
+        }
+        try {
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                mainExecutor,
+                object : AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                        var bytes: ByteArray? = null
+                        try {
+                            val hw = Bitmap.wrapHardwareBuffer(result.hardwareBuffer, result.colorSpace)
+                            if (hw != null) {
+                                val soft = hw.copy(Bitmap.Config.ARGB_8888, false)
+                                val maxSide = 1000
+                                val scale = maxSide.toFloat() / Math.max(soft.width, soft.height)
+                                val bmp = if (scale < 1f) {
+                                    Bitmap.createScaledBitmap(
+                                        soft,
+                                        (soft.width * scale).toInt(),
+                                        (soft.height * scale).toInt(),
+                                        true
+                                    )
+                                } else {
+                                    soft
+                                }
+                                val out = ByteArrayOutputStream()
+                                bmp.compress(Bitmap.CompressFormat.JPEG, 65, out)
+                                bytes = out.toByteArray()
+                            }
+                        } catch (e: Exception) {
+                            bytes = null
+                        } finally {
+                            try {
+                                result.hardwareBuffer.close()
+                            } catch (e: Exception) {
+                            }
+                        }
+                        callback(bytes)
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        callback(null)
+                    }
+                }
+            )
+        } catch (e: Exception) {
+            callback(null)
+        }
+    }
+
+    // List of the visible elements on screen (text, buttons, fields) for the AI.
+    fun describeScreen(): String {
+        val roots = allRoots()
+        if (roots.isEmpty()) return ""
+        val sb = StringBuilder()
+        var shown = 0
+
+        fun walk(n: AccessibilityNodeInfo?, depth: Int) {
+            if (n == null || shown >= 120 || depth > 25) return
+            val label = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim()
+            val flags = ArrayList<String>()
+            if (n.isClickable) flags.add("click")
+            if (n.isEditable) flags.add("input")
+            if (n.isScrollable) flags.add("scroll")
+            if (n.isChecked) flags.add("checked")
+            if (n.isVisibleToUser && (label.isNotEmpty() || n.isEditable)) {
+                sb.append("- ")
+                sb.append(if (label.isEmpty()) "(text field)" else label.take(70))
+                if (flags.isNotEmpty()) {
+                    sb.append(" [").append(flags.joinToString(",")).append("]")
+                }
+                sb.append('\n')
+                shown++
+            }
+            for (i in 0 until n.childCount) {
+                walk(n.getChild(i), depth + 1)
+            }
+        }
+
+        sb.append("Current app: ").append(roots[0].packageName ?: "?").append('\n')
+        for (r in roots) {
+            walk(r, 0)
+        }
+        return sb.toString()
     }
 }
