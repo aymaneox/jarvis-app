@@ -51,6 +51,7 @@ jobs:
               android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagReportViewIds"
               android:canPerformGestures="true"
               android:canRetrieveWindowContent="true"
+              android:canTakeScreenshot="true"
               android:notificationTimeout="100" />
           XML
           cat > android/app/src/main/res/values/jarvis_strings.xml << 'XML'
@@ -73,7 +74,7 @@ jobs:
           s = open(p).read()
           perms = ['INTERNET', 'RECORD_AUDIO', 'FOREGROUND_SERVICE',
                    'FOREGROUND_SERVICE_MICROPHONE', 'POST_NOTIFICATIONS',
-                   'SYSTEM_ALERT_WINDOW', 'WAKE_LOCK', 'VIBRATE',
+                   'SYSTEM_ALERT_WINDOW', 'WAKE_LOCK', 'VIBRATE', 'QUERY_ALL_PACKAGES',
                    'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS']
           add = ''.join('<uses-permission android:name="android.permission.%s"/>\n    ' % x for x in perms)
           add += '<uses-permission android:name="com.android.alarm.permission.SET_ALARM"/>\n    '
