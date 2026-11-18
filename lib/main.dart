@@ -97,6 +97,15 @@ class _ChatPageState extends State<ChatPage> {
   bool _heardSpeech = false;
   double _noise = 150;
 
+  // watchdog / health
+  Timer? _watchdog;
+  DateTime _lastFrame = DateTime.now();
+  DateTime _lastProgress = DateTime.now();
+  DateTime _lastRestart = DateTime.fromMillisecondsSinceEpoch(0);
+  int _zeroFrames = 0;
+  double _lastRms = 0;
+  bool _restarting = false;
+
   @override
   void initState() {
     super.initState();
@@ -277,9 +286,21 @@ class _ChatPageState extends State<ChatPage> {
     if (!mounted) return;
     setState(() => _active = true);
     _mode('idle');
+    _startWatchdog();
+
+    // ask once to enable the accessibility service (scroll, tap, screenshot)
+    try {
+      final on = await _native.invokeMethod<bool>('a11yEnabled') ?? false;
+      if (!on && !(p.getBool('a11y_asked') ?? false)) {
+        await p.setBool('a11y_asked', true);
+        _toast('Turn on "Jarvis control" in Accessibility so I can scroll, tap and take screenshots');
+        await _native.invokeMethod('openA11ySettings');
+      }
+    } catch (_) {}
   }
 
   Future<void> _deactivate() async {
+    _watchdog?.cancel();
     _inCall = false;
     _finishCapture(false);
     try {
@@ -324,6 +345,7 @@ class _ChatPageState extends State<ChatPage> {
         _pvKey,
         [BuiltInKeyword.JARVIS],
         _onWake,
+        sensitivities: [0.75],
         errorCallback: (e) => _toast('Wake word error: $e'),
       );
       await pm.start();
@@ -348,9 +370,75 @@ class _ChatPageState extends State<ChatPage> {
     _conversation(afterWake: true);
   }
 
+  // ---------------- watchdog (keeps the wake word alive) ----------------
+
+  void _startWatchdog() {
+    _watchdog?.cancel();
+    _lastFrame = DateTime.now();
+    _watchdog = Timer.periodic(const Duration(seconds: 2), (_) => _tick());
+  }
+
+  void _tick() {
+    if (!_active) return;
+    final now = DateTime.now();
+
+    // a call that is stuck for too long is reset
+    if (_inCall && now.difference(_lastProgress).inSeconds > 75) {
+      _inCall = false;
+      _capturing = false;
+      _finishCapture(false);
+      _mode('idle');
+    }
+
+    // microphone stopped or silenced: restart the wake word engine
+    if (!_inCall && _pm != null && !_restarting) {
+      final quietFor = now.difference(_lastFrame).inSeconds;
+      final sinceRestart = now.difference(_lastRestart).inSeconds;
+      if ((quietFor > 6 || _zeroFrames > 250) && sinceRestart > 15) {
+        _zeroFrames = 0;
+        _lastFrame = now;
+        _lastRestart = now;
+        _restartWake();
+      }
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _restartWake() async {
+    if (_restarting) return;
+    _restarting = true;
+    try {
+      try {
+        await _pm?.stop();
+        await _pm?.delete();
+      } catch (_) {}
+      _pm = null;
+      if (_listenerAdded) {
+        VoiceProcessor.instance?.removeFrameListener(_onFrame);
+        _listenerAdded = false;
+      }
+      await Future.delayed(const Duration(milliseconds: 400));
+      await _startWakeWord();
+    } finally {
+      _restarting = false;
+    }
+  }
+
   // ---------------- audio capture ----------------
 
   void _onFrame(List<int> frame) {
+    double sum = 0;
+    for (final s in frame) {
+      sum += s * s;
+    }
+    final rms = math.sqrt(sum / frame.length);
+    _lastRms = rms;
+    _lastFrame = DateTime.now();
+    if (rms < 1) {
+      _zeroFrames++;
+    } else {
+      _zeroFrames = 0;
+    }
     if (!_capturing) {
       _pre.add(frame);
       if (_pre.length > 10) _pre.removeAt(0);
@@ -358,11 +446,6 @@ class _ChatPageState extends State<ChatPage> {
     }
     _buf.addAll(frame);
     _frames++;
-    double sum = 0;
-    for (final s in frame) {
-      sum += s * s;
-    }
-    final rms = math.sqrt(sum / frame.length);
     final th = math.max(450.0, _noise * 2.8);
     if (rms > th) {
       _loud++;
@@ -444,14 +527,40 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> _conversation({required bool afterWake}) async {
     if (_inCall) return;
     _inCall = true;
+    _lastProgress = DateTime.now();
     var first = afterWake;
     var quiet = 0;
     try {
       while (_inCall) {
         _mode('listening');
+        _lastProgress = DateTime.now();
+
+        // if you only say "Jarvis" and wait, he answers "Yes?"
+        Timer? ack;
+        if (first) {
+          ack = Timer(const Duration(milliseconds: 1100), () async {
+            if (_capturing && !_heardSpeech && _inCall) {
+              _capturing = false;
+              _mode('speaking');
+              await _speak('Yes?');
+              await Future.delayed(const Duration(milliseconds: 250));
+              _pre.clear();
+              _buf = <int>[];
+              _loud = 0;
+              _silent = 0;
+              _frames = 0;
+              _heardSpeech = false;
+              _mode('listening');
+              _lastProgress = DateTime.now();
+              _capturing = true;
+            }
+          });
+        }
         final audio = await _recordUtterance(
             waitSeconds: first ? 7 : 9, usePre: first);
+        ack?.cancel();
         first = false;
+        _lastProgress = DateTime.now();
         if (audio == null || !_inCall) break;
 
         _mode('thinking');
@@ -481,6 +590,7 @@ class _ChatPageState extends State<ChatPage> {
           _mode('speaking');
           await _speak(r.say);
         }
+        _lastProgress = DateTime.now();
         if (r.end) break;
         await Future.delayed(const Duration(milliseconds: 250));
         _pre.clear();
@@ -559,7 +669,7 @@ Reply ONLY with one JSON object:
 {"heard":"<what the user said, in the user's language; empty if there was no clear speech>","say":"<spoken reply>","actions":[ ... ],"end":false}
 - If the audio has no clear speech, return heard "", say "", actions [], end false.
 - Ignore the wake word "Jarvis" at the start of the audio.
-- Set "end" to true when the user says goodbye or thanks, or clearly finished the conversation.
+- Set "end" to true when the user says goodbye, thanks, stop, that is all, never mind, go away, leave me, or clearly finished the conversation. Say a very short farewell in "say".
 - Use "actions": [] when the user only wants to talk.
 
 Action formats (use only these):
@@ -572,11 +682,22 @@ Action formats (use only these):
 {"type":"search","query":"..."}
 {"type":"youtube","query":"..."}
 {"type":"url","url":"https://..."}
+{"type":"scroll","direction":"up|down|left|right"}  scrolls the current screen (direction "down" shows content further down the page)
+{"type":"screenshot"}  takes a screenshot
+{"type":"screen_record"}  starts or stops the phone screen recording
+{"type":"system","action":"back|home|recents|notifications|quick_settings|lock"}
+{"type":"click","text":"<visible text or label of a button on screen>"}
+{"type":"type","text":"..."}  types text into the text box that is currently selected on screen
 
 Rules:
 - For "in N minutes" reminders use a timer. For a clock time use an alarm.
+- To write in another app: first open the app or chat, then use a type action, then a click action with the visible text of the send button.
+- Actions run in order, so you can chain them (open_app, type, click).
 - If a phone number is missing, ask for it in "say" and use no action.
 - In "say", briefly tell what you did. Never claim a message was sent: the user must press send.
+- If the user only calls your name ("Jarvis"), reply say "Yes, sir?" with no actions.
+- Never type passwords, codes or card numbers, and ask the user to confirm before payments, deleting things or sending money.
+- The scroll, screenshot, screen_record, system, click and type actions need the phone accessibility permission: if the user complains they do nothing, tell them to turn on "Jarvis control" in Accessibility settings.
 ''';
   }
 
@@ -629,7 +750,7 @@ Rules:
           'temperature': 0.3,
         },
       }),
-    );
+    ).timeout(const Duration(seconds: 25));
 
     if (res.statusCode != 200) {
       final b = res.body.length > 200 ? res.body.substring(0, 200) : res.body;
@@ -674,6 +795,20 @@ Rules:
 
   Future<void> _open(Uri uri) =>
       launchUrl(uri, mode: LaunchMode.externalApplication);
+
+  Future<void> _a11y(String method, Map<String, dynamic> args) async {
+    try {
+      final r = await _native.invokeMethod(method, args);
+      if (r == 'no_service') {
+        _addMsg('model',
+            'Turn on "Jarvis control" in Accessibility settings (tap the accessibility icon above).');
+      } else if (r == false) {
+        _addMsg('model', 'That did not work on this screen.');
+      }
+    } catch (e) {
+      _addMsg('model', 'Action failed: $e');
+    }
+  }
 
   Future<void> _run(Map<String, dynamic> a) async {
     try {
@@ -741,6 +876,24 @@ Rules:
           final smsBody = Uri.encodeComponent((a['text'] ?? '').toString());
           await _open(Uri.parse('sms:$smsNumber?body=$smsBody'));
           break;
+        case 'scroll':
+          await _a11y('scroll', {'direction': (a['direction'] ?? 'down').toString()});
+          break;
+        case 'screenshot':
+          await _a11y('global', {'action': 'screenshot'});
+          break;
+        case 'screen_record':
+          await _a11y('screenRecord', {});
+          break;
+        case 'system':
+          await _a11y('global', {'action': (a['action'] ?? '').toString()});
+          break;
+        case 'click':
+          await _a11y('clickText', {'text': (a['text'] ?? '').toString()});
+          break;
+        case 'type':
+          await _a11y('typeText', {'text': (a['text'] ?? '').toString()});
+          break;
         case 'search':
           await _open(Uri.https('www.google.com', '/search',
               {'q': (a['query'] ?? '').toString()}));
@@ -752,6 +905,11 @@ Rules:
         case 'url':
           await _open(Uri.parse((a['url'] ?? '').toString()));
           break;
+      }
+      // give a newly opened app time to appear before the next action (type, click...)
+      const launches = <String>{'open_app', 'whatsapp', 'sms', 'search', 'youtube', 'url', 'call'};
+      if (launches.contains(a['type'])) {
+        await Future.delayed(const Duration(milliseconds: 1500));
       }
     } catch (e) {
       _addMsg('model', 'Action failed: $e');
@@ -800,8 +958,8 @@ Rules:
     switch (_state) {
       case 'idle':
         return _pm != null
-            ? 'Say "Jarvis"...'
-            : 'Wake word is off. Tap the mic to talk.';
+            ? 'Say "Jarvis"...   (mic ${_lastRms.round()})'
+            : 'Wake word is off. Tap the call button to talk.';
       case 'listening':
         return 'Listening...';
       case 'thinking':
@@ -838,6 +996,14 @@ Rules:
             icon: const Icon(Icons.power_settings_new),
             color: _active ? Colors.cyan : Colors.grey,
             onPressed: _active ? _deactivate : _activate,
+          ),
+          IconButton(
+            icon: const Icon(Icons.accessibility_new),
+            onPressed: () async {
+              try {
+                await _native.invokeMethod('openA11ySettings');
+              } catch (_) {}
+            },
           ),
           IconButton(icon: const Icon(Icons.key), onPressed: _askKeys),
         ],
