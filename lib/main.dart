@@ -446,21 +446,27 @@ class _ChatPageState extends State<ChatPage> {
     }
     _buf.addAll(frame);
     _frames++;
-    final th = math.max(450.0, _noise * 2.8);
-    if (rms > th) {
+    // start of speech: needs a clear level; end of speech: lower level (hysteresis),
+    // so quiet word endings and short pauses do not cut you off
+    final startTh = math.max(400.0, _noise * 2.6);
+    final keepTh = math.max(260.0, _noise * 1.7);
+    if (rms > startTh) {
       _loud++;
       _silent = 0;
       if (_loud >= 3) _heardSpeech = true;
+    } else if (_heardSpeech && rms > keepTh) {
+      _silent = 0;
     } else {
       _loud = 0;
       _silent++;
       if (!_heardSpeech) _noise = _noise * 0.95 + rms * 0.05;
     }
-    if (_heardSpeech && _silent > 20) {
+    // about 1.3 seconds of real silence ends your sentence (32 ms per frame)
+    if (_heardSpeech && _silent > 40) {
       _finishCapture(true);
     } else if (!_heardSpeech && _frames > _maxWait) {
       _finishCapture(false);
-    } else if (_frames > 470) {
+    } else if (_frames > 750) {
       _finishCapture(_heardSpeech);
     }
   }
@@ -957,6 +963,9 @@ Rules:
   String _statusText() {
     switch (_state) {
       case 'idle':
+        if (_pm != null && _zeroFrames > 30) {
+          return 'Another app is using the microphone (voice message, call...). I will hear you again when it stops.';
+        }
         return _pm != null
             ? 'Say "Jarvis"...   (mic ${_lastRms.round()})'
             : 'Wake word is off. Tap the call button to talk.';
