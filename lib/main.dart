@@ -115,6 +115,9 @@ class _ChatPageState extends State<ChatPage> {
   final List<Map<String, dynamic>> _notifQueue = [];
   bool _draining = false;
   String? _lastLaunchPkg;
+  String _endReason = '';
+  List<String> _memories = [];
+  bool _capRecovering = false;
   bool _restarting = false;
 
   @override
@@ -364,6 +367,7 @@ class _ChatPageState extends State<ChatPage> {
       _key = p.getString('gemini_key') ?? '';
       _pvKey = p.getString('picovoice_key') ?? '';
       _notifOn = p.getBool('notif_on') ?? true;
+      _memories = p.getStringList('memories') ?? [];
     });
     if (_key.isEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _askKeys());
@@ -628,6 +632,11 @@ class _ChatPageState extends State<ChatPage> {
     }
     _buf.addAll(frame);
     _frames++;
+    // the phone silenced the microphone (zeros): grab it again
+    if (_zeroFrames > 40 && !_capRecovering && !_restarting) {
+      _capRecovering = true;
+      _restartWake().whenComplete(() => _capRecovering = false);
+    }
     // start of speech: needs a clear level; end of speech: lower level (hysteresis),
     // so quiet word endings and short pauses do not cut you off
     final startTh = math.max(400.0, _noise * 2.6);
@@ -745,12 +754,16 @@ class _ChatPageState extends State<ChatPage> {
             }
           });
         }
+        if (!first) await _beep(); // a short beep: "I am listening again"
         final audio = await _recordUtterance(
-            waitSeconds: first ? 7 : 9, usePre: first);
+            waitSeconds: first ? 7 : 12, usePre: first);
         ack?.cancel();
         first = false;
         _lastProgress = DateTime.now();
-        if (audio == null || !_inCall) break;
+        if (audio == null || !_inCall) {
+          _endReason = 'no speech reached me (mic level ${_lastRms.round()})';
+          break;
+        }
 
         _mode('thinking');
         Reply r;
@@ -762,21 +775,30 @@ class _ChatPageState extends State<ChatPage> {
 
         if (r.error) {
           _addMsg('model', r.say);
+          _endReason = r.say;
           break;
         }
         if (r.heard.isEmpty && r.say.isEmpty && r.actions.isEmpty) {
           quiet++;
-          if (quiet >= 2) break;
+          if (quiet >= 3) {
+            _endReason = 'I only heard noise three times';
+            break;
+          }
           continue;
         }
         quiet = 0;
         if (r.heard.isNotEmpty) _addMsg('user', r.heard);
         final done = await _handleReply(r, r.heard);
         _lastProgress = DateTime.now();
-        if (done.end) break;
-        await Future.delayed(const Duration(milliseconds: 250));
+        if (done.end) {
+          _endReason = 'you said goodbye';
+          break;
+        }
+        await Future.delayed(const Duration(milliseconds: 350));
         _pre.clear();
       }
+    } catch (e) {
+      _endReason = 'problem: $e';
     } finally {
       _inCall = false;
       _capturing = false;
@@ -839,6 +861,10 @@ class _ChatPageState extends State<ChatPage> {
     final t = '${n.year}-${two(n.month)}-${two(n.day)} '
         '${two(n.hour)}:${two(n.minute)} (${days[n.weekday - 1]})';
     final apps = _apps.take(150).map((a) => a['name']).join(', ');
+    var memLine = '';
+    if (_memories.isNotEmpty) {
+      memLine = 'Things the user taught you (use them when relevant):\n- ${_memories.join('\n- ')}\n';
+    }
     var notifLine = '';
     final pn = _pendingNotif;
     if (pn != null) {
@@ -853,12 +879,12 @@ The user talks to you by voice (audio) or text, in Arabic or English. ALWAYS ans
 This is a live voice call: keep "say" very short (max 2 sentences), natural, with no markdown.
 Current local time: $t.
 Installed apps on the phone: $apps.
-$notifLine
+$notifLine$memLine
 Reply ONLY with one JSON object:
-{"heard":"<what the user said, in the user's language; empty if there was no clear speech>","say":"<spoken reply>","actions":[ ... ],"end":false}
+{"heard":"<what the user said, in the user's language; empty if there was no clear speech>","actions":[ ... ],"say":"<spoken reply>","end":false}
 - If the audio has no clear speech, return heard "", say "", actions [], end false.
 - Ignore the wake word "Jarvis" at the start of the audio.
-- Set "end" to true when the user says goodbye, thanks, stop, that is all, never mind, go away, leave me, or clearly finished the conversation. Say a very short farewell in "say".
+- Set "end" to true ONLY when the user clearly dismisses you: goodbye, thanks that is all, stop, never mind, go away, leave me. Commands such as "go to settings", "go back" or "stop the music" are NOT dismissals: keep "end" false.
 - Use "actions": [] when the user only wants to talk.
 
 Action formats (use only these):
@@ -880,6 +906,10 @@ Action formats (use only these):
 {"type":"tap_at","x":0-1000,"y":0-1000}  taps a point on the screen (0,0 is top-left, 1000,1000 is bottom-right); use it when click by text is not possible
 {"type":"look"}  captures the phone screen; you then receive a screenshot plus the list of visible elements and continue the task
 {"type":"settings","page":"accessibility|wifi|bluetooth|display|sound|battery|battery_optimization|apps|all_apps|location|date|language|keyboard|storage|airplane|nfc|vpn|privacy|security|about|developer|data_usage|wireless|overlay|app_details","app":"<app name, only for app_details>"}  opens that exact Android settings page directly
+{"type":"web_answer","query":"<precise search query>"}  answers questions that need fresh or factual information (weather, news, scores, prices, who/what/when) using Google Search; do not guess such facts
+{"type":"remember","text":"<note>"}  saves something the user teaches you (a fact, a nickname, or a routine such as: When the user says \"movie time\": open Netflix, then volume 30). Saved notes are shown to you in every later request
+{"type":"forget","text":"<words of the note to delete>"}
+{"type":"intent","action":"android.intent.action.VIEW","data":"geo:0,0?q=pizza","package":"","mime":"","extras":{}}  runs any Android intent (maps, navigation with google.navigation:q=PLACE, sharing with action android.intent.action.SEND, mime text/plain and extras {"android.intent.extra.TEXT":"..."}, calendar event with action android.intent.action.INSERT, data content://com.android.calendar/events and extras {"title":"...","beginTime":<epoch milliseconds>,"endTime":<epoch milliseconds>})
 {"type":"reply","text":"..."}  replies directly to the pending notification (only when a notification is pending)
 {"type":"open_notification"}  opens the chat of the pending notification
 {"type":"volume","mode":"up|down|set|mute","level":0-100}
@@ -891,6 +921,10 @@ The call, whatsapp and sms actions accept "name" (the contact name as the user s
 
 Rules:
 - To open a phone settings page, use the "settings" action: it goes to the exact page.
+- If you say in "say" that you will do something, the SAME reply must contain the matching action. Never say "opening X" or "done" without the action.
+- You can talk about anything: answer general questions, explain, calculate, translate, tell jokes, give advice, plan, and brainstorm directly in "say" (max 3 sentences). For anything that needs fresh facts use web_answer. If a request matches no listed action, try the closest chain of actions (open_app, look, tap, type, intent) before saying you cannot.
+- When the user teaches you something ("remember that...", "from now on when I say X do Y"), use the remember action and confirm briefly.
+- If a notification is pending and the user says to open the app or the chat so they can reply themselves, use only {"type":"open_notification"}.
 - DICTATION: when the user dictates text to type, send or reply, copy their EXACT words from what you heard into "text". Do NOT include command words (type, write, message, say, send, tell) and do NOT rephrase, translate, correct or expand anything (keep "I'm" as "I'm"). Example: heard "type message hello I'm Jarvis I love you" gives {"type":"type","text":"hello I'm Jarvis I love you"}. Example: heard "tell Ahmed on WhatsApp I will be late" gives a whatsapp action with name "Ahmed" and text "I will be late".
 - BE FAST: for commands, "say" must be 5 words or fewer (for example "Done, sir." or "Opening WhatsApp."). Chain all the needed actions in one reply.
 - For tasks that need several steps on screen (menus, finding a button, forms): do one or two actions, then add {"type":"look"} as the LAST action to check the result. Repeat until the task is done, then confirm in "say" with no look action. Use at most 8 look steps.
@@ -1079,6 +1113,67 @@ Rules:
     'overlay': 'android.settings.action.MANAGE_OVERLAY_PERMISSION',
   };
 
+  Future<void> _beep() async {
+    try {
+      await _native.invokeMethod('beep');
+    } catch (_) {}
+    await Future.delayed(const Duration(milliseconds: 260));
+    _pre.clear();
+  }
+
+  static const _blockedIntents = <String>[
+    'DELETE', 'UNINSTALL', 'REBOOT', 'SHUTDOWN', 'FACTORY', 'MASTER_CLEAR', 'CALL_PRIVILEGED'
+  ];
+
+  // Answers questions that need fresh information, using Google Search.
+  Future<String> _webAnswer(String query) async {
+    try {
+      final res = await _http
+          .post(
+            Uri.parse(
+                'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent'),
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': _key,
+            },
+            body: jsonEncode({
+              'systemInstruction': {
+                'parts': [
+                  {
+                    'text':
+                        'You answer voice questions for a phone assistant. Use Google Search for current facts. Reply in English in at most 3 short spoken sentences. No markdown, no lists, no links.'
+                  }
+                ]
+              },
+              'contents': [
+                {
+                  'role': 'user',
+                  'parts': [
+                    {'text': query}
+                  ]
+                }
+              ],
+              'tools': [
+                {'google_search': {}}
+              ],
+              'generationConfig': {'temperature': 0.2},
+            }),
+          )
+          .timeout(const Duration(seconds: 25));
+      if (res.statusCode != 200) return 'I could not search the web right now.';
+      final data = jsonDecode(res.body);
+      final parts = data['candidates'][0]['content']['parts'] as List;
+      final t = parts
+          .where((p) => p['thought'] != true)
+          .map((p) => (p['text'] ?? '').toString())
+          .join()
+          .trim();
+      return t.isEmpty ? 'I found nothing useful.' : t;
+    } catch (_) {
+      return 'I could not search the web right now.';
+    }
+  }
+
   Future<void> _beat() async {
     try {
       await _native.invokeMethod('heartbeat');
@@ -1222,9 +1317,10 @@ Rules:
     var step = 0;
     while (true) {
       final wantLook = r.actions.any((a) => a['type'] == 'look');
+      final hasWeb = r.actions.any((x) => x['type'] == 'web_answer');
       final text = (r.say.isEmpty && !wantLook) ? 'Done.' : r.say;
       Future<void>? speaking;
-      if (text.isNotEmpty) {
+      if (text.isNotEmpty && !hasWeb) {
         _addMsg('model', text);
         if (!wantLook || step == 0) {
           _mode('speaking');
@@ -1321,14 +1417,14 @@ Rules:
           pkg ??= _aliases[target];
           var opened = false;
           if (pkg != null) {
-            opened = (await _native
-                    .invokeMethod<bool>('launchApp', {'package': pkg})) ??
+            opened = (await _native.invokeMethod<bool>(
+                    'launchApp', {'package': pkg, 'name': hit?['name'] ?? raw})) ??
                 false;
             if (opened) _lastLaunchPkg = pkg;
           }
           if (!opened) {
             _addMsg('model',
-                'I could not open "$raw". Apps I can see on this phone: ${_apps.length}. If that number is small, allow "Installed apps" for Jarvis in the phone app permissions.');
+                'I could not open "$raw". Apps I can see: ${_apps.length}. If it is installed, Android may be blocking it from the background: allow "Display pop-up windows while running in the background" for Jarvis, and turn on Jarvis control in Accessibility.');
           }
           break;
         case 'settings':
@@ -1433,10 +1529,71 @@ Rules:
           }
           break;
         case 'open_notification':
-          final ok2 = (_pendingNotif?['key'] ?? '').toString();
-          if (ok2.isNotEmpty) {
-            await _native.invokeMethod<bool>('openNotification', {'key': ok2});
+          final nkey = (_pendingNotif?['key'] ?? '').toString();
+          final npkg = (_pendingNotif?['package'] ?? '').toString();
+          final nname = (_pendingNotif?['app'] ?? '').toString();
+          var nOpened = false;
+          if (nkey.isNotEmpty) {
+            nOpened = (await _native
+                    .invokeMethod<bool>('openNotification', {'key': nkey})) ??
+                false;
           }
+          var inFront = false;
+          if (nOpened && npkg.isNotEmpty) {
+            inFront = (await _native.invokeMethod<bool>(
+                    'waitForApp', {'package': npkg, 'timeoutMs': 2500})) ??
+                false;
+          }
+          if (!inFront && npkg.isNotEmpty) {
+            // the chat did not open: open the app itself
+            await _native.invokeMethod<bool>(
+                'launchApp', {'package': npkg, 'name': nname});
+          }
+          break;
+        case 'web_answer':
+          final ans = await _webAnswer((a['query'] ?? '').toString());
+          _addMsg('model', ans);
+          _mode('speaking');
+          await _speak(ans);
+          break;
+        case 'remember':
+          final note = (a['text'] ?? '').toString().trim();
+          if (note.isNotEmpty) {
+            _memories.add(note);
+            if (_memories.length > 40) _memories.removeAt(0);
+            final pr1 = await SharedPreferences.getInstance();
+            await pr1.setStringList('memories', _memories);
+          }
+          break;
+        case 'forget':
+          final fq = _norm((a['text'] ?? '').toString());
+          if (fq.isNotEmpty) {
+            _memories.removeWhere((m) => _norm(m).contains(fq));
+            final pr2 = await SharedPreferences.getInstance();
+            await pr2.setStringList('memories', _memories);
+          }
+          break;
+        case 'intent':
+          final intentAction = (a['action'] ?? '').toString();
+          final allowed = (intentAction.startsWith('android.intent.action.') ||
+                  intentAction.startsWith('android.settings.') ||
+                  intentAction.startsWith('android.media.action.')) &&
+              !_blockedIntents.any((b) => intentAction.contains(b));
+          if (!allowed) {
+            _addMsg('model', 'I will not run that action.');
+            break;
+          }
+          final dataStr = (a['data'] ?? '').toString();
+          final pkgStr = (a['package'] ?? '').toString();
+          final mimeStr = (a['mime'] ?? '').toString();
+          final extras = a['extras'];
+          await AndroidIntent(
+            action: intentAction,
+            data: dataStr.isEmpty ? null : dataStr,
+            package: pkgStr.isEmpty ? null : pkgStr,
+            type: mimeStr.isEmpty ? null : mimeStr,
+            arguments: extras is Map ? Map<String, dynamic>.from(extras) : null,
+          ).launch();
           break;
         case 'volume':
           await _native.invokeMethod('volume', {
@@ -1549,6 +1706,14 @@ Rules:
   // ---------------- UI ----------------
 
   String _statusText() {
+    final base = _statusBase();
+    if (_state == 'idle' && _endReason.isNotEmpty) {
+      return '$base\nLast call ended: $_endReason';
+    }
+    return base;
+  }
+
+  String _statusBase() {
     switch (_state) {
       case 'idle':
         if (_pm != null && _zeroFrames > 30) {
