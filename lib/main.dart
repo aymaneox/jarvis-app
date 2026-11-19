@@ -109,11 +109,18 @@ class _ChatPageState extends State<ChatPage> {
   String _voiceName = '';
   double _pitch = 0.7;
   double _rate = 0.45;
+  final http.Client _http = http.Client();
+  bool _notifOn = true;
+  Map<String, dynamic>? _pendingNotif;
+  final List<Map<String, dynamic>> _notifQueue = [];
+  bool _draining = false;
+  String? _lastLaunchPkg;
   bool _restarting = false;
 
   @override
   void initState() {
     super.initState();
+    _native.setMethodCallHandler(_onNative);
     _setupVoice();
     _loadPrefs();
   }
@@ -356,11 +363,13 @@ class _ChatPageState extends State<ChatPage> {
     setState(() {
       _key = p.getString('gemini_key') ?? '';
       _pvKey = p.getString('picovoice_key') ?? '';
+      _notifOn = p.getBool('notif_on') ?? true;
     });
     if (_key.isEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _askKeys());
     } else if (p.getBool('active') ?? false) {
-      _activate();
+      await _activate();
+      await _backIfBgLaunch();
     }
   }
 
@@ -424,6 +433,7 @@ class _ChatPageState extends State<ChatPage> {
       return;
     }
     await Permission.notification.request();
+    await Permission.contacts.request();
     if (!(await Permission.systemAlertWindow.isGranted)) {
       _toast('Please allow "Display over other apps" for Jarvis');
       await Permission.systemAlertWindow.request();
@@ -452,6 +462,7 @@ class _ChatPageState extends State<ChatPage> {
         await _native.invokeMethod('openA11ySettings');
       }
     } catch (_) {}
+    await _checkNotifAccess();
   }
 
   Future<void> _deactivate() async {
@@ -542,6 +553,7 @@ class _ChatPageState extends State<ChatPage> {
 
   void _tick() {
     if (!_active) return;
+    _beat();
     final now = DateTime.now();
 
     // a call that is stuck for too long is reset
@@ -632,7 +644,7 @@ class _ChatPageState extends State<ChatPage> {
       if (!_heardSpeech) _noise = _noise * 0.95 + rms * 0.05;
     }
     // about 1.3 seconds of real silence ends your sentence (32 ms per frame)
-    if (_heardSpeech && _silent > 40) {
+    if (_heardSpeech && _silent > 32) {
       _finishCapture(true);
     } else if (!_heardSpeech && _frames > _maxWait) {
       _finishCapture(false);
@@ -827,6 +839,13 @@ class _ChatPageState extends State<ChatPage> {
     final t = '${n.year}-${two(n.month)}-${two(n.day)} '
         '${two(n.hour)}:${two(n.minute)} (${days[n.weekday - 1]})';
     final apps = _apps.take(150).map((a) => a['name']).join(', ');
+    var notifLine = '';
+    final pn = _pendingNotif;
+    if (pn != null) {
+      notifLine =
+          'PENDING NOTIFICATION: app "${pn['app']}", from "${pn['title']}", text "${pn['text']}". Direct reply possible: ${pn['canReply']}.\n'
+          'If the user wants to reply, use {"type":"reply","text":"<the exact words the user dictates>"}. If a direct reply is not possible, use {"type":"open_notification"} then type and click Send. If the user refuses or ignores it, do nothing and set "end" to true.\n';
+    }
 
     return '''
 You are Jarvis, a fast, witty and polite voice assistant on the user's phone, in the style of a calm British butler.
@@ -834,7 +853,7 @@ The user talks to you by voice (audio) or text, in Arabic or English. ALWAYS ans
 This is a live voice call: keep "say" very short (max 2 sentences), natural, with no markdown.
 Current local time: $t.
 Installed apps on the phone: $apps.
-
+$notifLine
 Reply ONLY with one JSON object:
 {"heard":"<what the user said, in the user's language; empty if there was no clear speech>","say":"<spoken reply>","actions":[ ... ],"end":false}
 - If the audio has no clear speech, return heard "", say "", actions [], end false.
@@ -861,9 +880,19 @@ Action formats (use only these):
 {"type":"tap_at","x":0-1000,"y":0-1000}  taps a point on the screen (0,0 is top-left, 1000,1000 is bottom-right); use it when click by text is not possible
 {"type":"look"}  captures the phone screen; you then receive a screenshot plus the list of visible elements and continue the task
 {"type":"settings","page":"accessibility|wifi|bluetooth|display|sound|battery|battery_optimization|apps|all_apps|location|date|language|keyboard|storage|airplane|nfc|vpn|privacy|security|about|developer|data_usage|wireless|overlay|app_details","app":"<app name, only for app_details>"}  opens that exact Android settings page directly
+{"type":"reply","text":"..."}  replies directly to the pending notification (only when a notification is pending)
+{"type":"open_notification"}  opens the chat of the pending notification
+{"type":"volume","mode":"up|down|set|mute","level":0-100}
+{"type":"media","action":"play_pause|next|previous"}
+{"type":"torch","on":true}
+{"type":"swipe","x1":0-1000,"y1":0-1000,"x2":0-1000,"y2":0-1000}
+{"type":"long_press","x":0-1000,"y":0-1000}
+The call, whatsapp and sms actions accept "name" (the contact name as the user said it) when you do not have a number.
 
 Rules:
 - To open a phone settings page, use the "settings" action: it goes to the exact page.
+- DICTATION: when the user dictates text to type, send or reply, copy their EXACT words from what you heard into "text". Do NOT include command words (type, write, message, say, send, tell) and do NOT rephrase, translate, correct or expand anything (keep "I'm" as "I'm"). Example: heard "type message hello I'm Jarvis I love you" gives {"type":"type","text":"hello I'm Jarvis I love you"}. Example: heard "tell Ahmed on WhatsApp I will be late" gives a whatsapp action with name "Ahmed" and text "I will be late".
+- BE FAST: for commands, "say" must be 5 words or fewer (for example "Done, sir." or "Opening WhatsApp."). Chain all the needed actions in one reply.
 - For tasks that need several steps on screen (menus, finding a button, forms): do one or two actions, then add {"type":"look"} as the LAST action to check the result. Repeat until the task is done, then confirm in "say" with no look action. Use at most 8 look steps.
 - When the user asks what is on the screen or what to do next, use a look action first, then answer in "say".
 - Never tap or type for payments, passwords, deleting data or sending money without asking the user to confirm first.
@@ -871,7 +900,7 @@ Rules:
 - For "in N minutes" reminders use a timer. For a clock time use an alarm.
 - To write in another app: first open the app or chat, then use a type action, then a click action with the visible text of the send button.
 - Actions run in order, so you can chain them (open_app, type, click).
-- If a phone number is missing, ask for it in "say" and use no action.
+- If you have neither a phone number nor a contact name, ask for it in "say" and use no action.
 - In "say", briefly tell what you did. Never claim a message was sent: the user must press send.
 - If the user only calls your name ("Jarvis"), reply say "Yes, sir?" with no actions.
 - Never type passwords, codes or card numbers, and ask the user to confirm before payments, deleting things or sending money.
@@ -885,6 +914,7 @@ Rules:
     String? screenText,
     String? goal,
     String? log,
+    String? event,
   }) async {
     var recent = _msgs.length > 10
         ? _msgs.sublist(_msgs.length - 10)
@@ -914,6 +944,14 @@ Rules:
         ],
       });
     }
+    if (event != null) {
+      contents.add({
+        'role': 'user',
+        'parts': [
+          {'text': event}
+        ],
+      });
+    }
     if (screen != null || screenText != null) {
       final parts = <Map<String, dynamic>>[];
       if (screen != null) {
@@ -927,7 +965,7 @@ Rules:
       contents.add({'role': 'user', 'parts': parts});
     }
 
-    final res = await http.post(
+    final res = await _http.post(
       Uri.parse(
           'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent'),
       headers: {
@@ -943,7 +981,7 @@ Rules:
         'contents': contents,
         'generationConfig': {
           'responseMimeType': 'application/json',
-          'temperature': 0.3,
+          'temperature': 0.1,
         },
       }),
     ).timeout(const Duration(seconds: 25));
@@ -1041,6 +1079,138 @@ Rules:
     'overlay': 'android.settings.action.MANAGE_OVERLAY_PERMISSION',
   };
 
+  Future<void> _beat() async {
+    try {
+      await _native.invokeMethod('heartbeat');
+    } catch (_) {}
+  }
+
+  Future<void> _backIfBgLaunch() async {
+    try {
+      final bg = await _native.invokeMethod<bool>('launchedInBackground') ?? false;
+      if (bg) await _native.invokeMethod('moveToBack');
+    } catch (_) {}
+  }
+
+  double _d(dynamic v, double def) => v is num ? v.toDouble() : def;
+
+  Future<String> _numberFor(Map<String, dynamic> a) async {
+    final direct = (a['number'] ?? '').toString().trim();
+    if (direct.isNotEmpty) return direct;
+    final name = (a['name'] ?? '').toString().trim();
+    if (name.isEmpty) return '';
+    try {
+      if (!(await Permission.contacts.isGranted)) {
+        await Permission.contacts.request();
+      }
+      return (await _native.invokeMethod<String>('contactNumber', {'name': name})) ?? '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  // ---------------- notifications ----------------
+
+  Future<dynamic> _onNative(MethodCall call) async {
+    if (call.method == 'notification') {
+      try {
+        _onNotification(Map<String, dynamic>.from(call.arguments as Map));
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  void _onNotification(Map<String, dynamic> n) {
+    if (!_notifOn || !_active || _key.isEmpty) return;
+    if (_notifQueue.length < 5) _notifQueue.add(n);
+    _drainNotifications();
+  }
+
+  Future<void> _drainNotifications() async {
+    if (_draining) return;
+    _draining = true;
+    try {
+      while (_notifQueue.isNotEmpty) {
+        var waited = 0;
+        while (_inCall && waited < 20) {
+          await Future.delayed(const Duration(seconds: 2));
+          waited++;
+        }
+        if (_inCall) {
+          _notifQueue.clear();
+          break;
+        }
+        final n = _notifQueue.removeAt(0);
+        _pendingNotif = n;
+        Reply r;
+        try {
+          r = await _askGemini(
+              event:
+                  'A notification just arrived. Announce it in one or two short English sentences: the app, who it is from and what it says (translate if needed). Then ask if the user wants to reply.');
+        } catch (_) {
+          r = Reply('', error: true);
+        }
+        if (r.error || r.say.isEmpty) {
+          _pendingNotif = null;
+          continue;
+        }
+        _addMsg('model', r.say);
+        _mode('speaking');
+        await _speak(r.say);
+        await _conversation(afterWake: false);
+        _pendingNotif = null;
+      }
+    } catch (_) {
+      _pendingNotif = null;
+    }
+    _draining = false;
+  }
+
+  Future<void> _checkNotifAccess({bool force = false}) async {
+    var on = false;
+    try {
+      on = await _native.invokeMethod<bool>('notifAccessEnabled') ?? false;
+    } catch (_) {}
+    if (on) return;
+    final p = await SharedPreferences.getInstance();
+    if (!force && (p.getBool('notif_asked') ?? false)) return;
+    await p.setBool('notif_asked', true);
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Let Jarvis read notifications'),
+        content: const Text(
+            'To tell you who messages you and to reply for you, turn on "Jarvis notifications" in Notification access.\n\nIf the switch is greyed out: open App info for Jarvis, tap the three dots, choose "Allow restricted settings", then try again.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Later'),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              _native.invokeMethod('openNotifSettings');
+            },
+            child: const Text('Open settings'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _toggleNotif() async {
+    final p = await SharedPreferences.getInstance();
+    setState(() => _notifOn = !_notifOn);
+    await p.setBool('notif_on', _notifOn);
+    if (_notifOn) {
+      await _checkNotifAccess(force: true);
+    }
+    _toast(_notifOn
+        ? 'I will tell you about new notifications'
+        : 'Notification announcements are off');
+  }
+
   String _describeAction(Map<String, dynamic> a) {
     final extra = a['text'] ?? a['name'] ?? a['page'] ?? a['direction'] ?? a['action'] ?? '';
     return '${a['type']} $extra'.trim();
@@ -1051,23 +1221,22 @@ Rules:
     final log = <String>[];
     var step = 0;
     while (true) {
-      var wantLook = false;
-      for (final a in r.actions) {
-        if (a['type'] == 'look') {
-          wantLook = true;
-          continue;
-        }
-        await _run(a);
-        log.add(_describeAction(a));
-      }
+      final wantLook = r.actions.any((a) => a['type'] == 'look');
       final text = (r.say.isEmpty && !wantLook) ? 'Done.' : r.say;
+      Future<void>? speaking;
       if (text.isNotEmpty) {
         _addMsg('model', text);
         if (!wantLook || step == 0) {
           _mode('speaking');
-          await _speak(text);
+          speaking = _speak(text); // talk while the actions run: faster
         }
       }
+      for (final a in r.actions) {
+        if (a['type'] == 'look') continue;
+        await _run(a);
+        log.add(_describeAction(a));
+      }
+      if (speaking != null) await speaking;
       if (!wantLook || step >= 8) return r;
       step++;
       _mode('thinking');
@@ -1155,6 +1324,7 @@ Rules:
             opened = (await _native
                     .invokeMethod<bool>('launchApp', {'package': pkg})) ??
                 false;
+            if (opened) _lastLaunchPkg = pkg;
           }
           if (!opened) {
             _addMsg('model',
@@ -1219,20 +1389,78 @@ Rules:
           ).launch();
           break;
         case 'call':
-          await AndroidIntent(
-            action: 'android.intent.action.DIAL',
-            data: 'tel:${_clean((a['number'] ?? '').toString(), plus: true)}',
-          ).launch();
+          final callNum = await _numberFor(a);
+          if (callNum.isEmpty) {
+            _addMsg('model', 'I could not find that phone number.');
+          } else {
+            await AndroidIntent(
+              action: 'android.intent.action.DIAL',
+              data: 'tel:${_clean(callNum, plus: true)}',
+            ).launch();
+          }
           break;
         case 'whatsapp':
-          final waNumber = _clean((a['number'] ?? '').toString());
-          final waText = Uri.encodeComponent((a['text'] ?? '').toString());
-          await _open(Uri.parse('https://wa.me/$waNumber?text=$waText'));
+          final waRaw = await _numberFor(a);
+          if (waRaw.isEmpty) {
+            _addMsg('model', 'I could not find that phone number.');
+          } else {
+            final waNumber = _clean(waRaw);
+            final waText = Uri.encodeComponent((a['text'] ?? '').toString());
+            await _open(Uri.parse('https://wa.me/$waNumber?text=$waText'));
+          }
           break;
         case 'sms':
-          final smsNumber = _clean((a['number'] ?? '').toString(), plus: true);
-          final smsBody = Uri.encodeComponent((a['text'] ?? '').toString());
-          await _open(Uri.parse('sms:$smsNumber?body=$smsBody'));
+          final smsRaw = await _numberFor(a);
+          if (smsRaw.isEmpty) {
+            _addMsg('model', 'I could not find that phone number.');
+          } else {
+            final smsNumber = _clean(smsRaw, plus: true);
+            final smsBody = Uri.encodeComponent((a['text'] ?? '').toString());
+            await _open(Uri.parse('sms:$smsNumber?body=$smsBody'));
+          }
+          break;
+        case 'reply':
+          final nk = (_pendingNotif?['key'] ?? '').toString();
+          var replied = false;
+          if (nk.isNotEmpty) {
+            replied = (await _native.invokeMethod<bool>('replyNotification',
+                    {'key': nk, 'text': (a['text'] ?? '').toString()})) ??
+                false;
+          }
+          if (!replied) {
+            _addMsg('model',
+                'I could not reply directly from the notification. I can open the chat and type it instead.');
+          }
+          break;
+        case 'open_notification':
+          final ok2 = (_pendingNotif?['key'] ?? '').toString();
+          if (ok2.isNotEmpty) {
+            await _native.invokeMethod<bool>('openNotification', {'key': ok2});
+          }
+          break;
+        case 'volume':
+          await _native.invokeMethod('volume', {
+            'mode': (a['mode'] ?? 'up').toString(),
+            'level': _int(a['level']),
+          });
+          break;
+        case 'media':
+          await _native.invokeMethod(
+              'media', {'action': (a['action'] ?? 'play_pause').toString()});
+          break;
+        case 'torch':
+          await _native.invokeMethod('torch', {'on': a['on'] != false});
+          break;
+        case 'swipe':
+          await _a11y('swipeAt', {
+            'x1': _d(a['x1'], 500),
+            'y1': _d(a['y1'], 700),
+            'x2': _d(a['x2'], 500),
+            'y2': _d(a['y2'], 300),
+          });
+          break;
+        case 'long_press':
+          await _a11y('longPressAt', {'x': _d(a['x'], 500), 'y': _d(a['y'], 500)});
           break;
         case 'scroll':
           await _a11y('scroll', {'direction': (a['direction'] ?? 'down').toString()});
@@ -1266,8 +1494,17 @@ Rules:
       }
       // give a newly opened app time to appear before the next action (type, click...)
       const launches = <String>{'open_app', 'whatsapp', 'sms', 'search', 'youtube', 'url', 'call'};
-      if (launches.contains(a['type'])) {
-        await Future.delayed(const Duration(milliseconds: 1500));
+      if (a['type'] == 'open_app' && _lastLaunchPkg != null) {
+        final wp = _lastLaunchPkg;
+        _lastLaunchPkg = null;
+        try {
+          await _native.invokeMethod<bool>(
+              'waitForApp', {'package': wp, 'timeoutMs': 3500});
+        } catch (_) {
+          await Future.delayed(const Duration(milliseconds: 1200));
+        }
+      } else if (launches.contains(a['type'])) {
+        await Future.delayed(const Duration(milliseconds: 1200));
       }
     } catch (e) {
       _addMsg('model', 'Action failed: $e');
@@ -1364,6 +1601,13 @@ Rules:
                 await _native.invokeMethod('openA11ySettings');
               } catch (_) {}
             },
+          ),
+          IconButton(
+            icon: Icon(_notifOn
+                ? Icons.notifications_active
+                : Icons.notifications_off),
+            color: _notifOn ? Colors.cyan : Colors.grey,
+            onPressed: _toggleNotif,
           ),
           IconButton(
             icon: const Icon(Icons.record_voice_over),
