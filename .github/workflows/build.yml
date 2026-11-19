@@ -74,7 +74,7 @@ jobs:
           s = open(p).read()
           perms = ['INTERNET', 'RECORD_AUDIO', 'FOREGROUND_SERVICE',
                    'FOREGROUND_SERVICE_MICROPHONE', 'POST_NOTIFICATIONS',
-                   'SYSTEM_ALERT_WINDOW', 'WAKE_LOCK', 'VIBRATE', 'QUERY_ALL_PACKAGES',
+                   'SYSTEM_ALERT_WINDOW', 'WAKE_LOCK', 'VIBRATE', 'QUERY_ALL_PACKAGES', 'READ_CONTACTS',
                    'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS']
           add = ''.join('<uses-permission android:name="android.permission.%s"/>\n    ' % x for x in perms)
           add += '<uses-permission android:name="com.android.alarm.permission.SET_ALARM"/>\n    '
@@ -88,6 +88,9 @@ jobs:
                  '    <service android:name=".JarvisAccessibilityService" android:exported="true" android:label="Jarvis control" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">\n'
                  '        <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>\n'
                  '        <meta-data android:name="android.accessibilityservice" android:resource="@xml/jarvis_accessibility"/>\n'
+                 '    </service>\n'
+                 '    <service android:name=".JarvisNotificationService" android:exported="true" android:label="Jarvis notifications" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">\n'
+                 '        <intent-filter><action android:name="android.service.notification.NotificationListenerService"/></intent-filter>\n'
                  '    </service>\n'
                  '    ')
           s = s.replace('</application>', svc + '</application>', 1)
