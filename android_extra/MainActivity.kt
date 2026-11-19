@@ -5,6 +5,7 @@ import android.content.Intent
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -50,18 +51,65 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "launchApp" -> {
-                    try {
-                        val pkg = call.argument<String>("package")
-                        val launch = if (pkg != null) packageManager.getLaunchIntentForPackage(pkg) else null
-                        if (launch != null) {
-                            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    val pkg = call.argument<String>("package")
+                    val label = call.argument<String>("name") ?: ""
+                    val launch = try {
+                        if (pkg != null) packageManager.getLaunchIntentForPackage(pkg) else null
+                    } catch (e: Exception) {
+                        null
+                    }
+                    if (launch == null || pkg == null) {
+                        result.success(false)
+                    } else {
+                        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        try {
                             applicationContext.startActivity(launch)
+                        } catch (e: Exception) {
+                        }
+                        val s = JarvisAccessibilityService.instance
+                        if (s == null) {
                             result.success(true)
                         } else {
-                            result.success(false)
+                            Thread {
+                                var ok = false
+                                var end = System.currentTimeMillis() + 1800
+                                while (System.currentTimeMillis() < end) {
+                                    if (s.currentPackage() == pkg) {
+                                        ok = true
+                                        break
+                                    }
+                                    Thread.sleep(150)
+                                }
+                                if (!ok) {
+                                    // second try: start it from the accessibility service
+                                    try {
+                                        s.startActivity(launch)
+                                    } catch (e: Exception) {
+                                    }
+                                    end = System.currentTimeMillis() + 1200
+                                    while (System.currentTimeMillis() < end) {
+                                        if (s.currentPackage() == pkg) {
+                                            ok = true
+                                            break
+                                        }
+                                        Thread.sleep(150)
+                                    }
+                                }
+                                if (!ok && label.isNotEmpty()) {
+                                    // last try: go Home and tap the icon like a person would
+                                    s.openAppViaUi(label)
+                                    end = System.currentTimeMillis() + 2000
+                                    while (System.currentTimeMillis() < end) {
+                                        if (s.currentPackage() == pkg) {
+                                            ok = true
+                                            break
+                                        }
+                                        Thread.sleep(150)
+                                    }
+                                }
+                                Handler(Looper.getMainLooper()).post { result.success(ok) }
+                            }.start()
                         }
-                    } catch (e: Exception) {
-                        result.success(false)
                     }
                 }
                 "waitForApp" -> {
@@ -112,6 +160,15 @@ class MainActivity : FlutterActivity() {
                 "setOrb" -> {
                     val state = call.argument<String>("state") ?: "idle"
                     KeepAliveService.instance?.setOrb(state)
+                    result.success(true)
+                }
+                "beep" -> {
+                    try {
+                        val tg = ToneGenerator(AudioManager.STREAM_MUSIC, 70)
+                        tg.startTone(ToneGenerator.TONE_PROP_ACK, 120)
+                        Handler(Looper.getMainLooper()).postDelayed({ tg.release() }, 500)
+                    } catch (e: Exception) {
+                    }
                     result.success(true)
                 }
                 "heartbeat" -> {
