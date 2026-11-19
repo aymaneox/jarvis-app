@@ -12,6 +12,8 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.IBinder
 import android.provider.Settings
 import android.view.Gravity
@@ -23,8 +25,34 @@ class KeepAliveService : Service() {
     companion object {
         @Volatile
         var instance: KeepAliveService? = null
+
+        // updated by the Dart side every few seconds; if it stops, the app was killed
+        @Volatile
+        var lastBeat: Long = 0L
         private const val CHANNEL_ID = "jarvis_listening"
         private const val NOTIF_ID = 4242
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var lastRelaunch = 0L
+
+    private val checker = object : Runnable {
+        override fun run() {
+            try {
+                val now = System.currentTimeMillis()
+                if (lastBeat > 0 && now - lastBeat > 45000 && now - lastRelaunch > 90000) {
+                    lastRelaunch = now
+                    val i = packageManager.getLaunchIntentForPackage(packageName)
+                    if (i != null) {
+                        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        i.putExtra("jarvis_bg", true)
+                        startActivity(i)
+                    }
+                }
+            } catch (e: Exception) {
+            }
+            handler.postDelayed(this, 10000)
+        }
     }
 
     private var orb: View? = null
@@ -45,6 +73,9 @@ class KeepAliveService : Service() {
             return START_NOT_STICKY
         }
         showOrb()
+        lastBeat = System.currentTimeMillis()
+        handler.removeCallbacks(checker)
+        handler.postDelayed(checker, 10000)
         return START_STICKY
     }
 
@@ -133,6 +164,7 @@ class KeepAliveService : Service() {
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(checker)
         try {
             orb?.let {
                 val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
