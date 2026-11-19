@@ -340,4 +340,25 @@ class JarvisAccessibilityService : AccessibilityService() {
         p.moveTo((dm.widthPixels * xNorm / 1000.0).toFloat(), (dm.heightPixels * yNorm / 1000.0).toFloat())
         return swipe(p, 800)
     }
+
+    // Opens an app by tapping its icon (works even when Android blocks starting
+    // activities from the background). Must run on a background thread.
+    fun openAppViaUi(label: String): Boolean {
+        if (label.isBlank()) return false
+        performGlobalAction(GLOBAL_ACTION_HOME)
+        Thread.sleep(800)
+        if (clickText(label)) return true
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels.toFloat()
+        val h = dm.heightPixels.toFloat()
+        for (attempt in 0 until 3) {
+            val up = Path()
+            up.moveTo(w * 0.5f, h * 0.85f)
+            up.lineTo(w * 0.5f, h * 0.25f)
+            swipe(up, 300)
+            Thread.sleep(900)
+            if (clickText(label)) return true
+        }
+        return false
+    }
 }
