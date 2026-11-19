@@ -315,4 +315,29 @@ class JarvisAccessibilityService : AccessibilityService() {
         }
         return sb.toString()
     }
+
+    // ---------- more gestures ----------
+
+    fun currentPackage(): String? {
+        return try {
+            rootInActiveWindow?.packageName?.toString()
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun swipeAt(x1: Double, y1: Double, x2: Double, y2: Double, ms: Long): Boolean {
+        val dm = resources.displayMetrics
+        val p = Path()
+        p.moveTo((dm.widthPixels * x1 / 1000.0).toFloat(), (dm.heightPixels * y1 / 1000.0).toFloat())
+        p.lineTo((dm.widthPixels * x2 / 1000.0).toFloat(), (dm.heightPixels * y2 / 1000.0).toFloat())
+        return swipe(p, ms)
+    }
+
+    fun longPressAt(xNorm: Double, yNorm: Double): Boolean {
+        val dm = resources.displayMetrics
+        val p = Path()
+        p.moveTo((dm.widthPixels * xNorm / 1000.0).toFloat(), (dm.heightPixels * yNorm / 1000.0).toFloat())
+        return swipe(p, 800)
+    }
 }
