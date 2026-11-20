@@ -118,6 +118,11 @@ class _ChatPageState extends State<ChatPage> {
   String _endReason = '';
   List<String> _memories = [];
   bool _capRecovering = false;
+  int _thinkMode = 0;
+  final List<String> _logs = [];
+  final List<Map<String, dynamic>> _recentNotifs = [];
+  DateTime _lastTick = DateTime.now();
+  bool _zeroLogged = false;
   bool _restarting = false;
 
   @override
@@ -523,10 +528,12 @@ class _ChatPageState extends State<ChatPage> {
       );
       await pm.start();
       _pm = pm;
+      _log('wake word is on');
       _wakeError = '';
       _attachFrames();
     } on PorcupineException catch (e) {
       _wakeError = '${e.message}';
+      _log('wake word failed: ${e.message}');
       _toast('Wake word failed: ${e.message}');
     } catch (e) {
       _wakeError = '$e';
@@ -543,6 +550,7 @@ class _ChatPageState extends State<ChatPage> {
 
   void _onWake(int index) {
     if (_inCall || !_active) return;
+    _log('wake word heard');
     HapticFeedback.mediumImpact();
     _conversation(afterWake: true);
   }
@@ -552,6 +560,7 @@ class _ChatPageState extends State<ChatPage> {
   void _startWatchdog() {
     _watchdog?.cancel();
     _lastFrame = DateTime.now();
+    _lastTick = DateTime.now();
     _watchdog = Timer.periodic(const Duration(seconds: 2), (_) => _tick());
   }
 
@@ -559,6 +568,16 @@ class _ChatPageState extends State<ChatPage> {
     if (!_active) return;
     _beat();
     final now = DateTime.now();
+    final gap = now.difference(_lastTick).inSeconds;
+    _lastTick = now;
+    if (gap > 8) _log('the app was paused or frozen by the phone for $gap s');
+    if (_zeroFrames > 30 && !_zeroLogged) {
+      _zeroLogged = true;
+      _log('the microphone is sending only silence (the phone may have silenced it)');
+    } else if (_zeroFrames == 0 && _zeroLogged) {
+      _zeroLogged = false;
+      _log('the microphone works again');
+    }
 
     // a call that is stuck for too long is reset
     if (_inCall && now.difference(_lastProgress).inSeconds > 75) {
@@ -573,6 +592,7 @@ class _ChatPageState extends State<ChatPage> {
       final quietFor = now.difference(_lastFrame).inSeconds;
       final sinceRestart = now.difference(_lastRestart).inSeconds;
       if ((quietFor > 6 || _zeroFrames > 250) && sinceRestart > 15) {
+        _log('restarting the wake word (quiet ${quietFor}s, zero frames $_zeroFrames)');
         _zeroFrames = 0;
         _lastFrame = now;
         _lastRestart = now;
@@ -653,7 +673,7 @@ class _ChatPageState extends State<ChatPage> {
       if (!_heardSpeech) _noise = _noise * 0.95 + rms * 0.05;
     }
     // about 1.3 seconds of real silence ends your sentence (32 ms per frame)
-    if (_heardSpeech && _silent > 32) {
+    if (_heardSpeech && _silent > 28) {
       _finishCapture(true);
     } else if (!_heardSpeech && _frames > _maxWait) {
       _finishCapture(false);
@@ -736,7 +756,7 @@ class _ChatPageState extends State<ChatPage> {
         // if you only say "Jarvis" and wait, he answers "Yes?"
         Timer? ack;
         if (first) {
-          ack = Timer(const Duration(milliseconds: 1100), () async {
+          ack = Timer(const Duration(milliseconds: 800), () async {
             if (_capturing && !_heardSpeech && _inCall) {
               _capturing = false;
               _mode('speaking');
@@ -800,6 +820,7 @@ class _ChatPageState extends State<ChatPage> {
     } catch (e) {
       _endReason = 'problem: $e';
     } finally {
+      _log('call ended: ${_endReason.isEmpty ? 'normal' : _endReason}');
       _inCall = false;
       _capturing = false;
       if (_ownMic) {
@@ -866,11 +887,19 @@ class _ChatPageState extends State<ChatPage> {
       memLine = 'Things the user taught you (use them when relevant):\n- ${_memories.join('\n- ')}\n';
     }
     var notifLine = '';
-    final pn = _pendingNotif;
-    if (pn != null) {
-      notifLine =
-          'PENDING NOTIFICATION: app "${pn['app']}", from "${pn['title']}", text "${pn['text']}". Direct reply possible: ${pn['canReply']}.\n'
-          'If the user wants to reply, use {"type":"reply","text":"<the exact words the user dictates>"}. If a direct reply is not possible, use {"type":"open_notification"} then type and click Send. If the user refuses or ignores it, do nothing and set "end" to true.\n';
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final recentN = _recentNotifs
+        .where((n) => nowMs - (n['time'] as int) < 1800000)
+        .toList();
+    if (recentN.isNotEmpty) {
+      final sb = StringBuffer('RECENT NOTIFICATIONS on the phone (newest first):\n');
+      for (var i = 0; i < recentN.length && i < 5; i++) {
+        final n = recentN[i];
+        final can = n['canReply'] == true ? 'reply possible' : 'cannot reply directly';
+        sb.writeln('${i + 1}. ${n['app']} from "${n['title']}": "${n['text']}" ($can)');
+      }
+      sb.writeln('When the user asks about messages or wants to reply, use this list. To reply use {"type":"reply","text":"<the exact words the user dictates>","to":"<sender name or app; omit for the newest>"}. If a direct reply is not possible, or the user wants to open the chat himself, use {"type":"open_notification","to":"<sender or app; omit for the newest>"} and nothing else. If the user refuses or ignores a notification, do nothing and set "end" to true.');
+      notifLine = '$sb\n';
     }
 
     return '''
@@ -910,8 +939,8 @@ Action formats (use only these):
 {"type":"remember","text":"<note>"}  saves something the user teaches you (a fact, a nickname, or a routine such as: When the user says \"movie time\": open Netflix, then volume 30). Saved notes are shown to you in every later request
 {"type":"forget","text":"<words of the note to delete>"}
 {"type":"intent","action":"android.intent.action.VIEW","data":"geo:0,0?q=pizza","package":"","mime":"","extras":{}}  runs any Android intent (maps, navigation with google.navigation:q=PLACE, sharing with action android.intent.action.SEND, mime text/plain and extras {"android.intent.extra.TEXT":"..."}, calendar event with action android.intent.action.INSERT, data content://com.android.calendar/events and extras {"title":"...","beginTime":<epoch milliseconds>,"endTime":<epoch milliseconds>})
-{"type":"reply","text":"..."}  replies directly to the pending notification (only when a notification is pending)
-{"type":"open_notification"}  opens the chat of the pending notification
+{"type":"reply","text":"...","to":"<sender or app, optional>"}  replies directly to a recent notification
+{"type":"open_notification","to":"<sender or app, optional>"}  opens the chat of a recent notification
 {"type":"volume","mode":"up|down|set|mute","level":0-100}
 {"type":"media","action":"play_pause|next|previous"}
 {"type":"torch","on":true}
@@ -999,26 +1028,20 @@ Rules:
       contents.add({'role': 'user', 'parts': parts});
     }
 
-    final res = await _http.post(
-      Uri.parse(
-          'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent'),
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': _key,
+    final sw = Stopwatch()..start();
+    final res = await _postGemini({
+      'systemInstruction': {
+        'parts': [
+          {'text': _systemPrompt()}
+        ]
       },
-      body: jsonEncode({
-        'systemInstruction': {
-          'parts': [
-            {'text': _systemPrompt()}
-          ]
-        },
-        'contents': contents,
-        'generationConfig': {
-          'responseMimeType': 'application/json',
-          'temperature': 0.1,
-        },
-      }),
-    ).timeout(const Duration(seconds: 25));
+      'contents': contents,
+      'generationConfig': {
+        'responseMimeType': 'application/json',
+        'temperature': 0.1,
+      },
+    });
+    _log('Gemini answered in ${sw.elapsedMilliseconds} ms');
 
     if (res.statusCode != 200) {
       final b = res.body.length > 200 ? res.body.substring(0, 200) : res.body;
@@ -1113,6 +1136,111 @@ Rules:
     'overlay': 'android.settings.action.MANAGE_OVERLAY_PERMISSION',
   };
 
+  void _log(String m) {
+    final t = DateTime.now();
+    String two(int x) => x.toString().padLeft(2, '0');
+    _logs.add('${two(t.hour)}:${two(t.minute)}:${two(t.second)}  $m');
+    if (_logs.length > 120) _logs.removeAt(0);
+  }
+
+  Future<void> _showLog() async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Jarvis log'),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 380,
+          child: SingleChildScrollView(
+            reverse: true,
+            child: SelectableText(
+              _logs.isEmpty ? 'Nothing yet.' : _logs.join('\n'),
+              style: const TextStyle(fontSize: 12),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              AndroidIntent(
+                action: 'android.settings.APPLICATION_DETAILS_SETTINGS',
+                data: 'package:com.kaido.jarvis_app',
+              ).launch();
+            },
+            child: const Text('App settings'),
+          ),
+          TextButton(
+            onPressed: () => Clipboard.setData(ClipboardData(text: _logs.join('\n'))),
+            child: const Text('Copy'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Map<String, dynamic>? _thinkCfg() {
+    if (_thinkMode == 0) return {'thinkingLevel': 'minimal'};
+    if (_thinkMode == 1) return {'thinkingBudget': 0};
+    return null;
+  }
+
+  // Sends a request to Gemini with the thinking turned down (much faster).
+  // If this model does not accept that setting, it falls back automatically.
+  Future<http.Response> _postGemini(Map<String, dynamic> body,
+      {int seconds = 30}) async {
+    while (true) {
+      final gc = Map<String, dynamic>.from((body['generationConfig'] as Map?) ?? {});
+      final tc = _thinkCfg();
+      if (tc != null) gc['thinkingConfig'] = tc;
+      final b = Map<String, dynamic>.from(body);
+      b['generationConfig'] = gc;
+      final res = await _http
+          .post(
+            Uri.parse(
+                'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent'),
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': _key,
+            },
+            body: jsonEncode(b),
+          )
+          .timeout(Duration(seconds: seconds));
+      if (res.statusCode == 400 &&
+          _thinkMode < 2 &&
+          res.body.toLowerCase().contains('think')) {
+        _thinkMode++;
+        _log('thinking setting not accepted, trying mode $_thinkMode');
+        continue;
+      }
+      return res;
+    }
+  }
+
+  Map<String, dynamic>? _pickNotif(String to, {bool needReply = false}) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final list = _recentNotifs
+        .where((n) => nowMs - (n['time'] as int) < 1800000)
+        .toList();
+    if (list.isEmpty) return null;
+    final t = _norm(to);
+    if (t.isNotEmpty) {
+      for (final n in list) {
+        if (_norm('${n['title']} ${n['app']}').contains(t)) return n;
+      }
+    }
+    if (needReply) {
+      for (final n in list) {
+        if (n['canReply'] == true) return n;
+      }
+    }
+    return list.first;
+  }
+
   Future<void> _beep() async {
     try {
       await _native.invokeMethod('beep');
@@ -1128,38 +1256,28 @@ Rules:
   // Answers questions that need fresh information, using Google Search.
   Future<String> _webAnswer(String query) async {
     try {
-      final res = await _http
-          .post(
-            Uri.parse(
-                'https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent'),
-            headers: {
-              'Content-Type': 'application/json',
-              'x-goog-api-key': _key,
-            },
-            body: jsonEncode({
-              'systemInstruction': {
-                'parts': [
-                  {
-                    'text':
-                        'You answer voice questions for a phone assistant. Use Google Search for current facts. Reply in English in at most 3 short spoken sentences. No markdown, no lists, no links.'
-                  }
-                ]
-              },
-              'contents': [
-                {
-                  'role': 'user',
-                  'parts': [
-                    {'text': query}
-                  ]
-                }
-              ],
-              'tools': [
-                {'google_search': {}}
-              ],
-              'generationConfig': {'temperature': 0.2},
-            }),
-          )
-          .timeout(const Duration(seconds: 25));
+      final res = await _postGemini({
+        'systemInstruction': {
+          'parts': [
+            {
+              'text':
+                  'You answer voice questions for a phone assistant. Use Google Search for current facts. Reply in English in at most 3 short spoken sentences. No markdown, no lists, no links.'
+            }
+          ]
+        },
+        'contents': [
+          {
+            'role': 'user',
+            'parts': [
+              {'text': query}
+            ]
+          }
+        ],
+        'tools': [
+          {'google_search': {}}
+        ],
+        'generationConfig': {'temperature': 0.2},
+      }, seconds: 25);
       if (res.statusCode != 200) return 'I could not search the web right now.';
       final data = jsonDecode(res.body);
       final parts = data['candidates'][0]['content']['parts'] as List;
@@ -1216,8 +1334,14 @@ Rules:
   }
 
   void _onNotification(Map<String, dynamic> n) {
-    if (!_notifOn || !_active || _key.isEmpty) return;
-    if (_notifQueue.length < 5) _notifQueue.add(n);
+    if (!_active) return;
+    final item = Map<String, dynamic>.from(n);
+    item['time'] = DateTime.now().millisecondsSinceEpoch;
+    _recentNotifs.insert(0, item);
+    if (_recentNotifs.length > 8) _recentNotifs.removeLast();
+    _log('notification from ${n['app']}');
+    if (!_notifOn || _key.isEmpty) return;
+    if (_notifQueue.length < 5) _notifQueue.add(item);
     _drainNotifications();
   }
 
@@ -1237,21 +1361,34 @@ Rules:
         }
         final n = _notifQueue.removeAt(0);
         _pendingNotif = n;
-        Reply r;
-        try {
-          r = await _askGemini(
-              event:
-                  'A notification just arrived. Announce it in one or two short English sentences: the app, who it is from and what it says (translate if needed). Then ask if the user wants to reply.');
-        } catch (_) {
-          r = Reply('', error: true);
+        final title = (n['title'] ?? '').toString();
+        final body = (n['text'] ?? '').toString();
+        final canReply = n['canReply'] == true;
+        var say = '';
+        if (RegExp(r'[\u0600-\u06FF]').hasMatch('$title $body')) {
+          // Arabic text: Gemini translates it for me
+          Reply r;
+          try {
+            r = await _askGemini(
+                event:
+                    'A notification just arrived (the newest in the list). Announce it in one or two short English sentences: the app, who it is from and what it says (translate it). Then ask if the user wants to reply.');
+          } catch (_) {
+            r = Reply('', error: true);
+          }
+          say = r.error ? '' : r.say;
+        } else {
+          // English text: read it right away, no waiting for the internet
+          final short = body.length > 140 ? '${body.substring(0, 140)}...' : body;
+          final who = title.isEmpty ? '' : '$title says: ';
+          say = '${n['app']}. $who$short ${canReply ? 'Shall I reply?' : 'Shall I open it?'}';
         }
-        if (r.error || r.say.isEmpty) {
+        if (say.isEmpty) {
           _pendingNotif = null;
           continue;
         }
-        _addMsg('model', r.say);
+        _addMsg('model', say);
         _mode('speaking');
-        await _speak(r.say);
+        await _speak(say);
         await _conversation(afterWake: false);
         _pendingNotif = null;
       }
@@ -1336,7 +1473,7 @@ Rules:
       if (!wantLook || step >= 8) return r;
       step++;
       _mode('thinking');
-      await Future.delayed(const Duration(milliseconds: 1000));
+      await Future.delayed(const Duration(milliseconds: 600));
       Uint8List? shot;
       var tree = '';
       try {
@@ -1516,7 +1653,7 @@ Rules:
           }
           break;
         case 'reply':
-          final nk = (_pendingNotif?['key'] ?? '').toString();
+          final nk = (_pickNotif((a['to'] ?? '').toString(), needReply: true)?['key'] ?? '').toString();
           var replied = false;
           if (nk.isNotEmpty) {
             replied = (await _native.invokeMethod<bool>('replyNotification',
@@ -1529,9 +1666,10 @@ Rules:
           }
           break;
         case 'open_notification':
-          final nkey = (_pendingNotif?['key'] ?? '').toString();
-          final npkg = (_pendingNotif?['package'] ?? '').toString();
-          final nname = (_pendingNotif?['app'] ?? '').toString();
+          final pn2 = _pickNotif((a['to'] ?? '').toString());
+          final nkey = (pn2?['key'] ?? '').toString();
+          final npkg = (pn2?['package'] ?? '').toString();
+          final nname = (pn2?['app'] ?? '').toString();
           var nOpened = false;
           if (nkey.isNotEmpty) {
             nOpened = (await _native
@@ -1788,9 +1926,16 @@ Rules:
               width: double.infinity,
               padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
               color: _statusColor().withOpacity(0.15),
-              child: Text(
-                _statusText(),
-                style: TextStyle(color: _statusColor()),
+              child: GestureDetector(
+                onTap: _showLog,
+                behavior: HitTestBehavior.opaque,
+                child: SizedBox(
+                  width: double.infinity,
+                  child: Text(
+                    '${_statusText()}\n(tap here to see the log)',
+                    style: TextStyle(color: _statusColor()),
+                  ),
+                ),
               ),
             ),
             Expanded(
