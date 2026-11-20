@@ -14,6 +14,8 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.net.wifi.WifiManager
 import android.os.IBinder
 import android.provider.Settings
 import android.view.Gravity
@@ -55,6 +57,46 @@ class KeepAliveService : Service() {
         }
     }
 
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
+    private fun acquireLocks() {
+        try {
+            if (wakeLock == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "jarvis:listening")
+                wl.setReferenceCounted(false)
+                wl.acquire()
+                wakeLock = wl
+            }
+        } catch (e: Exception) {
+        }
+        try {
+            if (wifiLock == null) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                @Suppress("DEPRECATION")
+                val wf = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "jarvis:wifi")
+                wf.setReferenceCounted(false)
+                wf.acquire()
+                wifiLock = wf
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun releaseLocks() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) {
+        }
+        try {
+            wifiLock?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) {
+        }
+        wakeLock = null
+        wifiLock = null
+    }
+
     private var orb: View? = null
     private var orbDrawable: GradientDrawable? = null
 
@@ -73,6 +115,7 @@ class KeepAliveService : Service() {
             return START_NOT_STICKY
         }
         showOrb()
+        acquireLocks()
         lastBeat = System.currentTimeMillis()
         handler.removeCallbacks(checker)
         handler.postDelayed(checker, 10000)
@@ -165,6 +208,7 @@ class KeepAliveService : Service() {
 
     override fun onDestroy() {
         handler.removeCallbacks(checker)
+        releaseLocks()
         try {
             orb?.let {
                 val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
